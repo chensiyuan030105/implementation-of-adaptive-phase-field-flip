@@ -18,15 +18,20 @@ parameter defaults, extracted as the implementation reference.
 | **2a. MSBG data structure** | 4.1–4.3 | **done**, validated |
 | **2b. Multiresolution Poisson operator** | 4.2, 6.1 | **done**, validated |
 | **2c. Adaptive particles + dual adaptivity** | 5.1–5.4 | **done**, validated |
-| 2d. Multiresolution P2G/G2P | 5.4 step 4 | **not done** — blocks running on MSBG |
-| 3. Multiresolution multigrid, adaptive relaxation | 6.2, 6.4 | not started |
+| **2d. Multiresolution P2G/G2P** | 5.4 step 4 | **done**, validated |
+| **3. Multiresolution multigrid** | 6.1–6.3 | **done**, validated |
+| 3b. Adaptive relaxation (active-block queue, θ) | 6.4 | not started |
 | 4. Escaped-particle droplets, spray, rendering | 3.4, 7 | not started |
 
-**The adaptive path cannot run a simulation yet.** Stages 2a–2c are built and
-tested in isolation; the missing piece is multiresolution P2G/G2P (2d), without
-which particles and the MSBG grid cannot exchange mass and momentum. The solver
-shipped for the MSBG path (`pfflip/mr_solver.py`) is Jacobi-CG for *validation
-only* — the paper's section 6 multigrid is stage 3.
+The adaptive path runs end to end. The section 6 multigrid keeps the iteration
+count flat across resolution (8 → 10 → 12 over a 4× range at 1000:1 contrast)
+where Jacobi-CG grows as ≈`h⁻¹`, for up to a 26× wall-clock speed-up.
+
+**Constraint on adaptive runs:** probabilistic coarsening Poisson-thins the
+particle cloud, so at 8 particles per cell a bulk liquid cell can fall under the
+`φ = 0.5` tagging threshold and flip its density by 1000×. Use `ppc >= 27` at
+the default `alpha_phi = 1`, or `alpha_phi <= 0.25` at low `ppc`.
+`AdaptiveSimulator` warns outside the measured-safe region.
 
 See `docs/FINDINGS.md` for measured accuracy of the 2:1 coarse-fine flux,
 including the regime where it does **not** converge.

@@ -36,10 +36,18 @@ from .msbg import MSBG
 
 
 class AdaptiveSimulator:
-    def __init__(self, cfg: Config, nblocks, n0=16, max_level=3, beta_bw=1.0):
+    def __init__(self, cfg: Config, nblocks, n0=16, max_level=3, beta_bw=1.0,
+                 frozen_levels=None, resample=True):
+        """``frozen_levels`` pins the refinement map instead of deriving it from
+        the particles, and ``resample=False`` disables particle refinement.
+        Both exist to isolate the multiresolution discretisation from the
+        adaptivity machinery when diagnosing."""
         self.cfg = cfg
         self.dev = cfg.device
         self.beta_bw = beta_bw
+        self.frozen_levels = frozen_levels
+        self.do_resample = resample
+        self.probe = False
 
         # finest spacing h0 fixes the domain: nblocks * n0 cells per axis
         self.grid = MSBG(nblocks, n0=n0, h0=cfg.dx, device=self.dev, max_level=max_level)
@@ -59,9 +67,39 @@ class AdaptiveSimulator:
         self.rho_0l = self.rho_tilde_0 * cfg.rho_l
         self.rho_min = cfg.eta_phi * cfg.rho_g * self.rho_tilde_0
 
+        self._check_noise_margin()
+
         self.time = 0.0
         self.step_index = 0
         self.stats: list[dict] = []
+
+    def _check_noise_margin(self):
+        """Warn when particle noise can cross the phase-tagging threshold.
+
+        Probabilistic coarsening Poisson-thins the particle cloud, so a bulk
+        liquid cell can come up sparse enough for phi to fall under the 0.5
+        air/liquid threshold -- which flips its density by 1000x and injects
+        energy FLIP cannot dissipate.  See docs/FINDINGS.md.  Measured safe:
+        ppc >= 27 at alpha_phi = 1, or alpha_phi <= 0.25 at ppc = 8.
+        """
+        import warnings
+
+        cfg = self.cfg
+        # phi < 0.5 needs rho~ below alpha_phi/4 of nominal; with Poisson noise
+        # of relative size 1/sqrt(ppc) that is roughly a k-sigma excursion
+        deficit = 1.0 - cfg.alpha_phi / 4.0
+        if deficit <= 0.0:
+            return
+        sigma = deficit * math.sqrt(cfg.ppc)
+        if sigma < 2.5:
+            warnings.warn(
+                f"ppc={cfg.ppc} with alpha_phi={cfg.alpha_phi} leaves only "
+                f"{sigma:.1f} sigma of margin above the phi=0.5 phase-tagging "
+                f"threshold under probabilistic coarsening. Bulk liquid cells "
+                f"will be mis-tagged as air, flipping their density by 1000x. "
+                f"Use ppc >= 27, or alpha_phi <= 0.25. See docs/FINDINGS.md.",
+                RuntimeWarning, stacklevel=3,
+            )
 
     # ------------------------------------------------------------------ setup
     def _calibrate(self) -> float:
@@ -114,6 +152,10 @@ class AdaptiveSimulator:
     def _rebuild_grid(self, dt_hint: float):
         """Paper 5.4 steps 1-3: refinement map, grading, allocation."""
         # start from the coarsest level and pull down with an atomic minimum
+        if self.frozen_levels is not None:
+            self.grid.build(self.frozen_levels)
+            self._ensure_channels()
+            return
         self._level_map.fill_(self.max_level)
         cfl_eps = max(self.cfg.cfl, 1.0) * self.cfg.dx
         wp.launch(
@@ -229,12 +271,20 @@ class AdaptiveSimulator:
                   inputs=[self.grid.g, ps.x, ps.v, ps.alpha, self.fvel, self.fdvel],
                   device=self.dev)
 
+        if self.probe:
+            self._probe_after_g2p = float(np.abs(ps.v.numpy()[:n]).max())
+            self._probe_phi = self.phi.numpy()
+            self._probe_p = float(np.abs(self.pressure.numpy()).max())
+
         # (6) per-particle refinement / probabilistic coarsening
-        dist = self._distance_field()
-        n_before, n_after = ps.resample(
-            dist, self.block_extent, beta_bw=self.beta_bw,
-            max_level=self.max_level, r0=cfg.r_p, seed=self.step_index,
-        )
+        if not self.do_resample:
+            n_before = n_after = ps.n
+        else:
+            dist = self._distance_field()
+            n_before, n_after = ps.resample(
+                dist, self.block_extent, beta_bw=self.beta_bw,
+                max_level=self.max_level, r0=cfg.r_p, seed=self.step_index,
+            )
 
         # (7) advect
         eps = 1e-4 * cfg.dx

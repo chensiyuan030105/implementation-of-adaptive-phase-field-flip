@@ -150,3 +150,79 @@ log-histogram threshold `theta`, and the block-local adaptive sweep count with
 its `r/r0 < 1/3` stopping rule (Algorithm 2) — is absent. Those are
 performance optimisations layered on this V-cycle; the convergence rates above
 are without them.
+
+---
+
+# Why the adaptive path's velocity field did not settle
+
+**Root cause: 8 particles per cell is too few for probabilistic coarsening at
+`alpha_phi = 1`.** Not a discretisation bug.
+
+## Isolating it
+
+A hydrostatic pool, 15 steps, watching peak liquid speed:
+
+| configuration | \|v\| trajectory | verdict |
+|---|---|---|
+| uniform grid, no resample | 0.048 → 0.127 → 0.092 | settles |
+| **static** adaptive grid, no resample | 0.048 → 0.126 → 0.092 | settles |
+| static adaptive grid + matched particle levels | 0.048 → 0.127 → 0.092 | settles |
+| full adaptive | 0.048 → **3.077** → 2.569 | diverges |
+
+A frozen adaptive grid is fine, so the multiresolution discretisation — P2G,
+G2P, the coarse-fine projection — is not implicated. Only the *transition*
+breaks.
+
+## The mechanism
+
+Probabilistic coarsening replaces a near-perfect lattice with a **Poisson**
+sample: it keeps each particle independently with probability `8^-dl`. At 8
+particles per cell the surviving density has ~35% RMS fluctuation. Splitting
+then clusters 8 children around each randomly-placed survivor, which keeps the
+distribution lumpy at the cell scale.
+
+A bulk liquid cell that happens to come up sparse has `phi` fall below the 0.5
+air/liquid tagging threshold of paper 3.3. That cell's `beta = 1/rho` then
+jumps by a factor of **1000**, which is a real 1000:1 density hole in the middle
+of the liquid. The pressure solve responds to it correctly, and the resulting
+spurious gradient accelerates the particles. At `alpha_FLIP = 0.985` with no
+physical viscosity, nothing dissipates the injected energy, so it persists long
+after the grid has stopped changing.
+
+Mis-tagged bulk-liquid cells appear on exactly the step the resample first
+fires, and track the divergence one-for-one:
+
+| `alpha_phi` | mis-tagged bulk cells per step | \|v\| at step 12 |
+|---|---|---|
+| 1.00 | 0, 0, 0, **3, 107, 88, 84** | 2.48 |
+| 0.50 | 0, 0, 0, 0, 0, 6, 6, 5 | 0.81 |
+| 0.25 | 0 throughout | 0.0006 |
+
+The counts match a Poisson estimate. At `alpha_phi = 1` mis-tagging needs a 75%
+density deficit; `P(k <= 2 | lambda = 8) ~ 1.4%` over 32768 cells predicts a few
+hundred cells, and ~100 are observed. At `alpha_phi = 0.25` it needs a 94%
+deficit, predicting ~0.
+
+## Two fixes, both principled
+
+| `alpha_phi` | ppc | \|v\| step 1 | \|v\| step 12 | max mis-tagged |
+|---|---|---|---|---|
+| 1.00 | 8 | 0.062 | 2.481 | 107 |
+| 1.00 | **27** | 0.025 | 0.236 | **0** |
+| 1.00 | **64** | 0.014 | 0.168 | **0** |
+| **0.25** | 8 | 0.000 | 0.001 | **0** |
+
+Either raise the particle count (noise falls as `1/sqrt(ppc)`) or lower
+`alpha_phi`, which raises `phi = sqrt(rho~ / (alpha_phi rho~_0l))` and so widens
+the margin above the 0.5 threshold. `alpha_phi` is exactly the knob paper 3.3
+documents for this: "controls the trade-off between noisiness (higher values)
+and stiffness (lower values) of the phase field". The paper's own
+Rayleigh-Taylor setup uses 0.5 (8.2).
+
+This also explains why stage 1 never showed the problem at 8 ppc: with no
+resampling the seeded lattice stays a lattice and is never Poisson-thinned.
+
+**Rule:** with adaptive particles, use `ppc >= 27` at the default
+`alpha_phi = 1`, or drop `alpha_phi` to ~0.25 if particle count is the binding
+constraint. `AdaptiveSimulator` warns when the combination is outside the
+tested-safe region.

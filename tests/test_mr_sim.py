@@ -189,3 +189,67 @@ def test_multigrid_iterations_are_resolution_independent():
         f"iteration counts {counts} grew {growth:.1f}x over a 4x resolution range; "
         "a working multigrid should be nearly h-independent"
     )
+
+
+# ------------------------------------------------- phase-tagging noise margin
+def test_resample_does_not_mistag_bulk_liquid():
+    """Probabilistic coarsening must not knock bulk liquid cells into the air tag.
+
+    Coarsening Poisson-thins the particle cloud, so a bulk liquid cell can come
+    up sparse enough for phi to drop under the 0.5 threshold of paper 3.3.
+    That cell's beta = 1/rho then jumps by 1000x -- a real density hole inside
+    the liquid -- and the pressure solve accelerates particles away from it.
+    With alpha_FLIP = 0.985 nothing dissipates the energy, so the run never
+    settles.  See docs/FINDINGS.md.
+    """
+    import warp as wp
+
+    from pfflip.msbg import Grid, cell_center
+
+    @wp.kernel
+    def _ctr(g: Grid, o: wp.array(dtype=wp.vec3)):
+        a = wp.tid()
+        o[a] = cell_center(g, a)
+
+    def mistagged(alpha_phi, ppc):
+        cfg = Config(res=(32,) * 3, dx=1 / 32, cfl=1.0, device=DEV,
+                     pcg_max_iter=400, alpha_phi=alpha_phi, ppc=ppc)
+        sim = AdaptiveSimulator(cfg, (4, 4, 4), n0=8, max_level=1, beta_bw=0.34)
+        per = round(ppc ** (1 / 3))
+        _seed_pool(sim, cfg, per=per)
+        worst, speeds = 0, []
+        for _ in range(10):
+            sim.step()
+            ctr = wp.zeros(sim.grid.ncells, dtype=wp.vec3, device=DEV)
+            wp.launch(_ctr, dim=sim.grid.ncells, inputs=[sim.grid.g, ctr], device=DEV)
+            deep = ctr.numpy()[:, 1] < 0.40 * sim.domain[1]
+            worst = max(worst, int((deep & (sim.is_liquid.numpy() == 0)).sum()))
+            speeds.append(_liquid_stats(sim)[0])
+        return worst, speeds
+
+    # the paper's own stiffness knob (3.3) buys the margin back at low ppc
+    bad, speeds_bad = mistagged(alpha_phi=1.0, ppc=8)
+    good, speeds_good = mistagged(alpha_phi=0.25, ppc=8)
+
+    assert bad > 0, "expected the low-margin configuration to mis-tag (guard is calibrated to it)"
+    assert good == 0, f"alpha_phi=0.25 still mis-tagged {good} bulk cells"
+    assert speeds_good[-1] < 0.1 * speeds_bad[-1], (
+        f"velocity did not settle with the margin restored: "
+        f"{speeds_good[-1]:.4f} vs {speeds_bad[-1]:.4f}"
+    )
+
+
+def test_noise_margin_guard_fires():
+    """The constructor must warn for combinations measured to mis-tag."""
+    import warnings
+
+    def warns(ppc, alpha_phi):
+        cfg = Config(res=(32,) * 3, dx=1 / 32, device=DEV, ppc=ppc, alpha_phi=alpha_phi)
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            AdaptiveSimulator(cfg, (4, 4, 4), n0=8, max_level=1)
+            return any(issubclass(x.category, RuntimeWarning) for x in w)
+
+    assert warns(8, 1.0), "ppc=8 at alpha_phi=1 is the configuration that diverges"
+    assert not warns(27, 1.0), "ppc=27 at alpha_phi=1 was measured safe"
+    assert not warns(8, 0.25), "alpha_phi=0.25 at ppc=8 was measured safe"
