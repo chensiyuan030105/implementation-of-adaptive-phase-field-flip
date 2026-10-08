@@ -98,3 +98,55 @@ stable bands, because the block-resolution `d~` shifts when the resolution
 changes. Both effects are measured at 8 blocks/axis with `n0 = 8` (a 64³ finest
 grid) — far smaller than the regime the method targets, where bands have room
 to be many blocks wide. Whether they persist at scale is untested.
+
+---
+
+# Stage 3: multiresolution multigrid
+
+Measured with `tol = 1e-4` on a beta field carrying a sharp 1000:1 jump (a
+liquid/air interface), comparing the two preconditioners behind the same
+flexible-CG driver.
+
+| grid | cells | Jacobi-CG | MG-PCG | speed-up |
+|---|---|---|---|---|
+| 32³ uniform | 32,768 | 94 it | 8 it | — (JIT-dominated) |
+| 64³ uniform | 262,144 | 154 it / 1.29 s | **10 it / 0.16 s** | 8.0× |
+| 128³ uniform | 2,097,152 | 379 it / 9.73 s | **12 it / 0.45 s** | 21.7× |
+| 32³ adaptive | 18,432 | 94 it | 7 it | 3.4× |
+| 64³ adaptive | 147,456 | 196 it / 1.18 s | **9 it / 0.13 s** | 9.2× |
+| 128³ adaptive | 1,179,648 | 417 it / 6.47 s | **11 it / 0.25 s** | 26.1× |
+
+Jacobi grows roughly as `h^-1`; the multigrid count is flat (8 → 10 → 12 over a
+4× resolution range), which is the defining property of a working multigrid and
+is what section 6 exists to deliver.
+
+## Why re-discretisation rather than variational Galerkin
+
+`mr_operator` derives each coupling as `beta * Area / dist` from the grid
+geometry, so only `beta` needs transferring and the coarse coefficient is the
+mean of the four fine faces — Algorithm 1's `s * sum / 4` with `s` supplied by
+geometry instead of tabulated. Sampling the 2×2 patch through `locate` makes
+Algorithm 1's copy-by-reference case fall out for free: when the fine block has
+the same resolution, all four probes land on the same cell.
+
+The cost is that the V-cycle is only approximately symmetric. That is exactly
+why the outer Krylov method must be **flexible** CG with a Polak-Ribière update
+(paper 6.4) rather than standard PCG.
+
+## Two bugs this exposed
+
+1. **Polak–Ribière was silently inert.** `r_prev` was snapshotted *after* the
+   `axpy` that updates `r`, so `beta = <z, r − r_prev>/rz` evaluated to 0 every
+   iteration and the method degenerated to steepest descent.
+2. **Stale multigrid hierarchy.** The simulator reallocated its solver only
+   when the cell *count* changed, but the hierarchy is built from the per-block
+   refinement *map*. Two different maps with the same cell count would have
+   shared a hierarchy. Now keyed on the map itself.
+
+## Not implemented from section 6
+
+The adaptive relaxation of 6.4 — the active-block FIFO queue, the
+log-histogram threshold `theta`, and the block-local adaptive sweep count with
+its `r/r0 < 1/3` stopping rule (Algorithm 2) — is absent. Those are
+performance optimisations layered on this V-cycle; the convergence rates above
+are without them.

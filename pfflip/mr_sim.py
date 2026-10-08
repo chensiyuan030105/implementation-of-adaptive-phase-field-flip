@@ -49,6 +49,7 @@ class AdaptiveSimulator:
 
         self.particles = P.Particles(self.dev, capacity=1024)
         self._ncells = -1
+        self._level_sig = None
         self._scalar = wp.zeros(1, dtype=float, device=self.dev)
         self._level_map = wp.zeros(self.grid.nblk, dtype=wp.int32, device=self.dev)
         self._block_phase = wp.zeros(self.grid.nblk * 2, dtype=wp.int32, device=self.dev)
@@ -83,10 +84,23 @@ class AdaptiveSimulator:
 
     # ------------------------------------------------------------------ channels
     def _ensure_channels(self):
+        """Reallocate channels and the solver when the grid topology changes.
+
+        Keyed on the *refinement map*, not on the cell count: the multigrid
+        hierarchy is built from the per-block levels, so two different maps
+        that happen to yield the same number of cells must not share a solver.
+        """
         n = self.grid.ncells
-        if n == self._ncells:
+        sig = hash(self.grid.level_h.tobytes())
+        if sig == self._level_sig:
             return
+        self._level_sig = sig
+        realloc = n != self._ncells
         self._ncells = n
+        if not realloc:
+            # same size, different topology: buffers are fine, solver is not
+            self.solver = MRSolver(self.grid, self.dev)
+            return
         z = lambda m=1: wp.zeros(n * m, dtype=float, device=self.dev)  # noqa: E731
         self.fmass, self.fmom = z(3), z(3)
         self.fvel, self.fvel_star, self.fdvel = z(3), z(3), z(3)

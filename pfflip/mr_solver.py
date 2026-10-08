@@ -1,11 +1,14 @@
-"""Matrix-free Krylov solver on an MSBG.
+"""Matrix-free Krylov solver on an MSBG (paper section 6).
 
-Stage 2 ships a Jacobi-preconditioned CG, which is enough to *validate* the
-multiresolution discretisation of :mod:`pfflip.mr_operator` but is not the
-paper's solver: section 6's multiresolution Galerkin multigrid with adaptive
-relaxation (Algorithms 1 and 2) is stage 3.  Expect Jacobi-CG to need many
-iterations at the paper's 1000:1 density contrast -- that is exactly the
-ill-conditioning section 6 exists to remove.
+Flexible preconditioned CG with a **Polak-Ribiere** update (paper 6.4), so a
+preconditioner that is only approximately symmetric stays safe.  Two
+preconditioners are available:
+
+* ``"mg"`` (default) -- one V-cycle of :class:`pfflip.mr_multigrid.MRMultigrid`,
+  the multiresolution multigrid of section 6;
+* ``"jacobi"`` -- diagonal scaling, kept for comparison.  At the paper's
+  1000:1 density contrast this needs hundreds of iterations, which is exactly
+  the ill-conditioning section 6 exists to remove.
 
 The system is singular (pure Neumann, both phases fill the box), so the
 constant null vector is projected out of the right-hand side and the solution.
@@ -64,9 +67,15 @@ def _jacobi(r: wp.array(dtype=float), diag: wp.array(dtype=float), z: wp.array(d
 
 
 class MRSolver:
-    def __init__(self, grid, device):
+    def __init__(self, grid, device, preconditioner="mg", **mg_kwargs):
         self.grid = grid
         self.dev = device
+        self.kind = preconditioner
+        self.mg = None
+        if preconditioner == "mg":
+            from .mr_multigrid import MRMultigrid
+
+            self.mg = MRMultigrid(grid, device, **mg_kwargs)
         n = grid.ncells
         self.n = n
         z = lambda: wp.zeros(n, dtype=float, device=device)  # noqa: E731
@@ -76,6 +85,7 @@ class MRSolver:
         self.q = z()
         self.Ap = z()
         self.b = z()
+        self.r_prev = z()
         self._s = wp.zeros(1, dtype=float, device=device)
 
     # ----------------------------------------------------------------- utils
@@ -90,6 +100,15 @@ class MRSolver:
 
     def prepare(self, bface):
         wp.launch(mro.compute_diag, dim=self.n, inputs=[self.grid.g, bface, self.diag], device=self.dev)
+        if self.mg is not None:
+            self.mg.build_hierarchy(bface)
+
+    def _apply_preconditioner(self, r, z):
+        if self.mg is not None:
+            self.mg.precondition(r, z)
+        else:
+            wp.launch(_jacobi, dim=self.n, inputs=[r, self.diag, z], device=self.dev)
+            self._remove_mean(z)
 
     # ----------------------------------------------------------------- solve
     def solve(self, bface, rhs, p_out, *, tol=1e-4, max_iter=2000, verbose=False):
@@ -105,8 +124,7 @@ class MRSolver:
 
         p_out.zero_()
         wp.copy(self.r, self.b)
-        wp.launch(_jacobi, dim=n, inputs=[self.r, self.diag, self.zv], device=dev)
-        self._remove_mean(self.zv)
+        self._apply_preconditioner(self.r, self.zv)
         wp.copy(self.q, self.zv)
         rz = self._reduce(_dot, self.r, self.zv)
 
@@ -118,20 +136,25 @@ class MRSolver:
                 break
             alpha = rz / qAq
             wp.launch(_axpy, dim=n, inputs=[alpha, self.q, p_out], device=dev)
+            # snapshot r *before* the update: Polak-Ribiere needs r_{k-1}
+            wp.copy(self.r_prev, self.r)
             wp.launch(_axpy, dim=n, inputs=[-alpha, self.Ap, self.r], device=dev)
             rel = self._reduce(_max_abs, self.r) / bnorm
             if verbose and it % 50 == 0:
                 print(f"    cg {it:5d}  {rel:.3e}")
             if rel < tol:
                 break
-            wp.launch(_jacobi, dim=n, inputs=[self.r, self.diag, self.zv], device=dev)
-            self._remove_mean(self.zv)
+            self._apply_preconditioner(self.r, self.zv)
             rz_new = self._reduce(_dot, self.r, self.zv)
             if rz == 0.0 or rz_new <= 0.0:
                 # float32 stagnation: the residual can no longer be reduced, so
                 # beta is meaningless.  Stop rather than divide by zero.
                 break
-            wp.launch(_scale_add, dim=n, inputs=[self.q, rz_new / rz, self.zv], device=dev)
+            # Polak-Ribiere: beta = <z, r - r_prev> / <z_prev, r_prev>.  The
+            # re-discretised V-cycle is not exactly symmetric, so the flexible
+            # form is required (paper 6.4).
+            beta = max((rz_new - self._reduce(_dot, self.r_prev, self.zv)) / rz, 0.0)
+            wp.launch(_scale_add, dim=n, inputs=[self.q, beta, self.zv], device=dev)
             rz = rz_new
 
         self._remove_mean(p_out)

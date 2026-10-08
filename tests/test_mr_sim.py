@@ -127,3 +127,65 @@ def test_adaptive_run_conserves_liquid_centroid():
     drift = max(ys) - min(ys)
     assert drift < 0.02 * sim.domain[1], f"liquid centroid wandered by {drift:.4f}"
     assert any(r["compression"] > 1.5 for r in sim.stats), "grid never coarsened at all"
+
+
+# ------------------------------------------------------------------ multigrid
+def test_multigrid_iterations_are_resolution_independent():
+    """The point of paper section 6: iteration count must not grow with h.
+
+    Jacobi-CG on this system scales roughly as h^-1 (94 -> 154 -> 379 across
+    32/64/128^3 at 1000:1 contrast).  A working multigrid preconditioner keeps
+    it flat.  Asserted on an *adaptive* grid at the paper's density contrast,
+    since that is the regime the solver exists for.
+    """
+    import warp as wp
+
+    from pfflip import mr_operator as mro
+    from pfflip.mr_solver import MRSolver
+    from pfflip.msbg import MSBG, Grid, cell_center
+
+    @wp.kernel
+    def _ctr(g: Grid, c: wp.array(dtype=wp.vec3)):
+        a = wp.tid()
+        c[a] = cell_center(g, a)
+
+    counts = []
+    for nb in (2, 4, 8):
+        n0 = 16
+        g = MSBG((nb,) * 3, n0=n0, h0=1.0 / (nb * n0), device=DEV, max_level=1)
+        bx, by, bz = np.meshgrid(*[np.arange(nb)] * 3, indexing="ij")
+        g.build(np.where(bx < nb // 2, 0, 1).ravel().astype(np.int32))
+        n = g.ncells
+
+        c = wp.zeros(n, dtype=wp.vec3, device=DEV)
+        v = wp.zeros(n, dtype=float, device=DEV)
+        wp.launch(_ctr, dim=n, inputs=[g.g, c], device=DEV)
+        wp.launch(mro.cell_volume, dim=n, inputs=[g.g, v], device=DEV)
+        x = c.numpy().astype(np.float64)
+        V = v.numpy().astype(np.float64)
+
+        # a sharp 1000:1 coefficient jump, as a liquid/air interface produces
+        bf = np.ones(n * 3, np.float32)
+        bf[np.repeat(x[:, 1] < 0.5, 3)] = 1e-3
+
+        k = 2 * np.pi
+        ex = np.cos(k * x[:, 0]) * np.cos(k * x[:, 1]) * np.cos(k * x[:, 2])
+        b = 3 * k * k * ex * V
+        b -= b.mean()
+
+        p = wp.zeros(n, dtype=float, device=DEV)
+        solver = MRSolver(g, DEV, preconditioner="mg")
+        it, rel = solver.solve(
+            wp.array(bf, dtype=float, device=DEV),
+            wp.array(b.astype(np.float32), dtype=float, device=DEV),
+            p, tol=1e-4, max_iter=500,
+        )
+        assert rel < 1e-4, f"MG-PCG failed to converge at {g.fine_res[0]}^3 ({rel:.2e})"
+        counts.append(it)
+
+    assert max(counts) < 30, f"iteration counts {counts} are too high for multigrid"
+    growth = counts[-1] / counts[0]
+    assert growth < 2.5, (
+        f"iteration counts {counts} grew {growth:.1f}x over a 4x resolution range; "
+        "a working multigrid should be nearly h-independent"
+    )
