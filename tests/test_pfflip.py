@@ -118,3 +118,72 @@ def test_projection_reduces_divergence():
     sim._project(dt)
     div_after = sim._max_divergence()
     assert div_after < 0.05 * div_before, f"{div_before:.3e} -> {div_after:.3e}"
+
+
+# ------------------------------------------------- escaped particles / spray
+def test_bubbles_are_deleted_and_droplets_merge_back():
+    """Paper 3.4's three transitions must all fire."""
+    cfg = Config(res=(32,) * 3, dx=1 / 32, cfl=1.0, device=DEV, ppc=27,
+                 droplets=True, delta_phi=0.2)
+    sim = Simulator(cfg)
+    sim.set_particles(*scenes.asteroid_impact(cfg))
+    for _ in range(25):
+        sim.step()
+    s = sim.droplet_stats
+    assert s["bubbles"] > 0, "air particles trapped in liquid are never deleted"
+    counts = sim.state_counts()
+    assert counts["flip"] + counts["droplet"] + counts["dead"] == sim.n_particles
+    # dead particles must stay dead and droplets must not contribute to the grid
+    assert counts["dead"] == s["bubbles"] or counts["dead"] >= s["bubbles"] - s["merged"]
+
+
+def test_droplet_threshold_is_coupled_to_particle_count():
+    """``delta_phi`` and ``ppc`` are not independent knobs.
+
+    An isolated liquid particle splats its *own* mass into the phase field, so
+    eq. (7) floors it at ``phi_single = 1/sqrt(alpha_phi * rho~_0)`` with
+    ``rho~_0 ~ 0.638 * ppc``.  Conversion to a droplet needs
+    ``phi_single < 1/2 - delta_phi``, i.e.
+
+        ppc > 1 / (alpha_phi * 0.638 * (1/2 - delta_phi)**2)
+
+    At the paper's defaults (``alpha_phi = 1``, ``delta_phi = 0.2``) that is
+    ppc > 17.4 -- so at 8 particles per cell escaped particles essentially never
+    convert, and the spray channel is silently dead.
+    """
+    import math
+
+    for ppc in (8, 27):
+        cfg = Config(res=(16,) * 3, dx=1 / 16, device=DEV, ppc=ppc)
+        sim = Simulator(cfg)
+        phi_single = 1.0 / math.sqrt(cfg.alpha_phi * sim.rho_tilde_0)
+        predicted = 0.638 * ppc
+        assert abs(sim.rho_tilde_0 - predicted) / predicted < 0.10, (
+            f"rho~_0 = {sim.rho_tilde_0:.2f} vs predicted {predicted:.2f}"
+        )
+        convertible = phi_single < 0.5 - cfg.delta_phi
+        assert convertible == (ppc >= 18), (
+            f"ppc={ppc}: phi_single={phi_single:.3f}, threshold={0.5-cfg.delta_phi:.2f}"
+        )
+
+
+def test_droplets_do_not_contribute_to_the_grid():
+    """A droplet is a Lagrangian point mass: it must not splat into P2G."""
+    cfg = Config(res=(16,) * 3, dx=1 / 16, cfl=1.0, device=DEV, ppc=8, droplets=True)
+    sim = Simulator(cfg)
+    sim.set_particles(*scenes.still_pool(cfg, fill=0.5))
+    sim.step()
+    m_all = sim.cell_mass.numpy().sum()
+
+    # flag a tenth of the liquid particles as droplets and re-run P2G only
+    st = sim.pstate.numpy()
+    liq = np.flatnonzero(sim.ptype.numpy() == 1)
+    st[liq[::10]] = 1
+    sim.pstate.assign(st)
+    sim._p2g()
+    m_flip = sim.cell_mass.numpy().sum()
+    assert m_flip < m_all, "droplets still contributed mass to the grid"
+    # liquid is only ~half the particles but ~99.9% of the mass (1000:1 density
+    # ratio), so removing a tenth of the liquid removes a tenth of the mass
+    removed = 1.0 - m_flip / m_all
+    assert abs(removed - 0.10) < 0.02, f"expected ~10% of mass removed, got {100*removed:.1f}%"

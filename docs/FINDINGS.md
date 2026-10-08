@@ -226,3 +226,67 @@ resampling the seeded lattice stays a lattice and is never Poisson-thinned.
 `alpha_phi = 1`, or drop `alpha_phi` to ~0.25 if particle count is the binding
 constraint. `AdaptiveSimulator` warns when the combination is outside the
 tested-safe region.
+
+---
+
+# `delta_phi` and `ppc` are coupled through eq. (7)
+
+The escaped-particle test of paper 3.4 — convert a liquid particle where
+`phi(x*) < 1/2 - delta_phi`, with `delta_phi = 0.2` — cannot fire at low
+particle counts, because **an isolated liquid particle splats its own mass into
+the phase field it is then tested against**.
+
+A single particle contributes a kernel weight of at most 1 against a
+normalisation of `rho~_0`, so eq. (7) floors it at
+
+    phi_single = 1 / sqrt(alpha_phi * rho~_0),     rho~_0 ~ 0.638 * ppc
+
+Conversion requires `phi_single < 1/2 - delta_phi`, i.e.
+
+    ppc  >  1 / (alpha_phi * 0.638 * (1/2 - delta_phi)^2)
+
+At the paper's defaults that is **ppc > 17.4**:
+
+| ppc | `phi_single` | threshold `0.5 - delta_phi` | escaped particles convert? |
+|---|---|---|---|
+| 8 | 0.45 | 0.30 | **no** |
+| 27 | 0.24 | 0.30 | yes |
+| 64 | 0.16 | 0.30 | yes |
+
+Measured on a 64³ asteroid impact at ppc = 8, over 80 steps: `phi` at liquid
+particles had minimum 0.294 and 0.01-percentile 0.41 — exactly one particle out
+of 2.1 million fell below the threshold, and 1 droplet was emitted. At ppc = 27
+the same scene emitted 2,018 by step 91 and the merge-back path fired 24,118
+times. **The spray channel fails silently at low ppc** — nothing errors, there
+is simply no spray.
+
+This is the same binding constraint that the mis-tagging analysis above
+produced from a completely different direction (Poisson noise under
+probabilistic coarsening). Two independent requirements converge on `ppc >= 27`.
+
+## What is implemented from sections 3.4 and 7
+
+* escaped-particle classification with `delta_phi = 0.2`: liquid → droplet,
+  air inside liquid → bubble → **deleted** (as the paper does), droplet
+  re-entering liquid → back to a FLIP particle;
+* droplets as purely Lagrangian point masses under gravity + sphere drag
+  `a = 3 rho_g C_d |v_rel| v_rel / (8 rho_l r)`, with per-droplet adaptive
+  sub-stepping;
+* log-normal radii on emission (Babinsky & Sojka 2002);
+* the evaporation ODE `dr/dt ~ -1/r`, RK2 (Sirignano 2010);
+* extra spray emission in steep-velocity-gradient regions (Ihmsen et al. 2012)
+  — in practice this dominates escaped-particle emission by ~100:1;
+* a 16-bit-float spray density field at 2–4× the pressure resolution,
+  rasterised only at render time.
+
+Droplets share the FLIP particle arrays and are distinguished by a `state`
+channel, so every conversion is a flag flip and no stream compaction is needed.
+
+**Not implemented:** the paper's MSBG volumetric ray tracer with approximate
+multiple scattering, and particle-skinning surface reconstruction.
+`pfflip/render.py` is a single-scattering ray marcher over the phase field and
+the spray density with one shadow ray to the sun. It shows the structure, but
+at 64³ / 7M particles the spray reads as discrete beads rather than mist —
+there are only ~10⁴ droplets where the paper has billions of particles. That
+gap is the paper's motivation for adaptivity and scale, not something a
+renderer can close.

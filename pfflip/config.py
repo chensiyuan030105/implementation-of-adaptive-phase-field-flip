@@ -76,6 +76,37 @@ class Config:
     """Liquid velocity is extrapolated 'a few cells' into the air phase so
     that liquid particles advect with liquid velocities."""
 
+    # ---- escaped particles / spray (paper 3.4, 7) --------------------------
+    droplets: bool = True
+    """Convert escaped particles into Lagrangian droplets."""
+
+    delta_phi: float = 0.2
+    """Escaped-particle threshold offset (paper 3.4): a liquid particle where
+    phi < 0.5 - delta_phi becomes a droplet, an air particle where
+    phi > 0.5 + delta_phi is a bubble and is deleted."""
+
+    droplet_radius_mean: float = 0.25
+    droplet_radius_spread: float = 0.5
+    """Log-normal droplet radii on emission (paper 7, Babinsky & Sojka 2002),
+    in units of dx."""
+
+    droplet_drag_cd: float = 0.5
+    """Sphere drag coefficient; a = 3 rho_g Cd |v_rel| v_rel / (8 rho_l r)."""
+
+    evaporation_k: float = 0.0
+    """Rate in dr/dt = -k/r (paper 7, Sirignano 2010).  0 disables it."""
+
+    spray_shear_threshold: float = 0.0
+    """Emit extra spray where |grad u| exceeds this (paper 7).  0 disables;
+    a sensible value is a few times the mean interfacial shear."""
+
+    spray_emission_rate: float = 0.02
+    spray_resolution_factor: int = 2
+    """Spray density field resolution relative to the pressure grid; the paper
+    uses 2-4x at 16-bit float."""
+
+    droplet_max_substeps: int = 8
+
     # ---- runtime -----------------------------------------------------------
     device: str = "cuda:0"
     seed: int = 42

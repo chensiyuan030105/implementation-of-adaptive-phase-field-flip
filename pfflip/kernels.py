@@ -104,6 +104,7 @@ def p2g_face(
     ptype: wp.array(dtype=wp.int32),
     pmass: wp.array(dtype=float),
     prad: wp.array(dtype=float),
+    pstate: wp.array(dtype=wp.int32),
     mass: wp.array3d(dtype=float),
     mom: wp.array3d(dtype=float),
     axis: int,
@@ -116,6 +117,10 @@ def p2g_face(
     its interface representation "for free".
     """
     p = wp.tid()
+    # droplets are purely Lagrangian and bubbles are gone: neither contributes
+    # mass or momentum to the grid (paper 3.4, 7)
+    if pstate[p] != 0:
+        return
     xp = px[p]
     mp = pmass[p]
     rp = prad[p]
@@ -158,6 +163,7 @@ def p2g_cell(
     px: wp.array(dtype=wp.vec3),
     pmass: wp.array(dtype=float),
     prad: wp.array(dtype=float),
+    pstate: wp.array(dtype=wp.int32),
     cell_mass: wp.array3d(dtype=float),
     cell_wsum: wp.array3d(dtype=float),
     dx: float,
@@ -168,6 +174,8 @@ def p2g_cell(
     is the particle-density estimate used by the ``c_div`` volume correction.
     """
     p = wp.tid()
+    if pstate[p] != 0:
+        return
     xp = px[p]
     mp = pmass[p]
     rp = prad[p]
@@ -462,6 +470,7 @@ def g2p(
     px: wp.array(dtype=wp.vec3),
     pv: wp.array(dtype=wp.vec3),
     ptype: wp.array(dtype=wp.int32),
+    pstate: wp.array(dtype=wp.int32),
     u: wp.array3d(dtype=float),
     v: wp.array3d(dtype=float),
     w: wp.array3d(dtype=float),
@@ -478,6 +487,8 @@ def g2p(
     phase-dependent numerical viscosity (paper 3.7).
     """
     p = wp.tid()
+    if pstate[p] != 0:
+        return
     xp = px[p]
     alpha = wp.where(ptype[p] == LIQUID, alpha_liquid, alpha_air)
     delta = sample_velocity(du, dv, dw, xp, dx)
@@ -498,6 +509,7 @@ def field_difference(a: wp.array3d(dtype=float), b: wp.array3d(dtype=float), out
 def advect_rk3(
     px: wp.array(dtype=wp.vec3),
     ptype: wp.array(dtype=wp.int32),
+    pstate: wp.array(dtype=wp.int32),
     u: wp.array3d(dtype=float),
     v: wp.array3d(dtype=float),
     w: wp.array3d(dtype=float),
@@ -515,6 +527,8 @@ def advect_rk3(
     cells into the air phase (paper 3.7), air particles with the raw field.
     """
     p = wp.tid()
+    if pstate[p] != 0:
+        return  # droplets are integrated by pfflip.droplets instead
     x = px[p]
     liquid = ptype[p] == LIQUID
 
@@ -536,8 +550,11 @@ def advect_rk3(
 
 
 @wp.kernel
-def particle_max_speed(pv: wp.array(dtype=wp.vec3), out: wp.array(dtype=float)):
+def particle_max_speed(pv: wp.array(dtype=wp.vec3), pstate: wp.array(dtype=wp.int32),
+                       out: wp.array(dtype=float)):
     p = wp.tid()
+    if pstate[p] == 2:
+        return
     wp.atomic_max(out, 0, wp.length(pv[p]))
 
 
@@ -545,11 +562,14 @@ def particle_max_speed(pv: wp.array(dtype=wp.vec3), out: wp.array(dtype=float)):
 def reflect_at_walls(
     px: wp.array(dtype=wp.vec3),
     pv: wp.array(dtype=wp.vec3),
+    pstate: wp.array(dtype=wp.int32),
     lo: wp.vec3,
     hi: wp.vec3,
 ):
     """Clamp particles into the box and kill the inward-pointing component."""
     p = wp.tid()
+    if pstate[p] == 2:
+        return
     x = px[p]
     v = pv[p]
     xo = wp.vec3(0.0, 0.0, 0.0)

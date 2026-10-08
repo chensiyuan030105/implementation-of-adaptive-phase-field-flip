@@ -21,11 +21,17 @@ parameter defaults, extracted as the implementation reference.
 | **2d. Multiresolution P2G/G2P** | 5.4 step 4 | **done**, validated |
 | **3. Multiresolution multigrid** | 6.1–6.3 | **done**, validated |
 | 3b. Adaptive relaxation (active-block queue, θ) | 6.4 | not started |
-| 4. Escaped-particle droplets, spray, rendering | 3.4, 7 | not started |
+| **4. Escaped-particle droplets + spray** | 3.4, 7 | **done** (renderer is single-scatter, not the paper's MSBG tracer) |
 
 The adaptive path runs end to end. The section 6 multigrid keeps the iteration
 count flat across resolution (8 → 10 → 12 over a 4× range at 1000:1 contrast)
 where Jacobi-CG grows as ≈`h⁻¹`, for up to a 26× wall-clock speed-up.
+
+**Constraint on spray:** `delta_phi` and `ppc` are coupled through eq. (7) —
+an isolated liquid particle splats its own mass into the field it is tested
+against, flooring it at `1/sqrt(alpha_phi * rho~_0)`. At the paper's defaults
+escaped-particle conversion needs `ppc > 17.4`; below that the spray channel
+fails silently. See `docs/FINDINGS.md`.
 
 **Constraint on adaptive runs:** probabilistic coarsening Poisson-thins the
 particle cloud, so at 8 particles per cell a bulk liquid cell can fall under the

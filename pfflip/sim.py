@@ -14,9 +14,10 @@ TODO below):
  7. extrapolate liquid velocity into the air phase                [3.7]
  8. advect with RK3                                               [3.7]
 
+ 9. escaped particles -> Lagrangian droplets, spray      [3.4, 7]
+
 TODO (stage 2): MSBG blocks, adaptive particles (section 4, 5).
 TODO (stage 3): adaptive relaxation / active-block queue (section 6.4).
-TODO: escaped-particle droplets and spray (sections 3.4, 7).
 """
 
 from __future__ import annotations
@@ -27,6 +28,7 @@ import time
 import numpy as np
 import warp as wp
 
+from . import droplets as D
 from . import kernels as K
 from .config import Config
 from .poisson import MGPCG
@@ -84,7 +86,18 @@ class Simulator:
         self.ptype = None
         self.pmass = None
         self.prad = None
+        self.pstate = None
+        self.pdrop_r = None
         self.n_particles = 0
+
+        # spray density field at 2-4x the pressure resolution (paper 7)
+        f = max(1, int(cfg.spray_resolution_factor))
+        self.spray_res = tuple(n * f for n in self.res)
+        self.dx_spray = cfg.dx / f
+        self.spray_density = wp.zeros(self.spray_res, dtype=wp.float16, device=self.dev)
+        self.shear = z(self.res)
+        self._counters = wp.zeros(4, dtype=wp.int32, device=self.dev)
+        self.droplet_stats = {"emitted": 0, "bubbles": 0, "merged": 0, "spray": 0}
 
         # eq. (7) normalisation, calibrated from a perfect lattice
         self.rho_tilde_0 = self._calibrate_rho_tilde_0()
@@ -131,12 +144,14 @@ class Simulator:
         mass = np.where(ptype == 1, cfg.rho_l, cfg.rho_g).astype(np.float32)
         self.pmass = wp.array(mass, dtype=float, device=self.dev)
         self.prad = wp.array(np.full(n, cfg.r_p, np.float32), dtype=float, device=self.dev)
+        self.pstate = wp.zeros(n, dtype=wp.int32, device=self.dev)
+        self.pdrop_r = wp.zeros(n, dtype=float, device=self.dev)
 
     # ------------------------------------------------------------------ step
     def dt_from_cfl(self) -> float:
         cfg = self.cfg
         self._scalar.zero_()
-        wp.launch(K.particle_max_speed, dim=self.n_particles, inputs=[self.pv, self._scalar], device=self.dev)
+        wp.launch(K.particle_max_speed, dim=self.n_particles, inputs=[self.pv, self.pstate, self._scalar], device=self.dev)
         vmax = float(self._scalar.numpy()[0])
         g = float(np.linalg.norm(cfg.gravity))
         # include the velocity gravity will add this step
@@ -159,6 +174,7 @@ class Simulator:
         div_after = self._max_divergence()
         self._g2p()
         self._extrapolate_liquid_velocity()
+        self._droplets(dt)
         self._advect(dt)
 
         wp.synchronize_device(self.dev)
@@ -172,6 +188,7 @@ class Simulator:
             "pcg_iter": pcg_it,
             "pcg_res": pcg_res,
             "max_div": div_after,
+            "droplets": int((self.pstate.numpy() == 1).sum()) if cfg.droplets else 0,
             "wall_s": wall,
         }
         self.stats.append(rec)
@@ -191,14 +208,15 @@ class Simulator:
             wp.launch(
                 K.p2g_face,
                 dim=n,
-                inputs=[self.px, self.pv, self.ptype, self.pmass, self.prad,
+                inputs=[self.px, self.pv, self.ptype, self.pmass, self.prad, self.pstate,
                         self.mass[ax], self.mom[ax], ax, self.cfg.dx],
                 device=self.dev,
             )
         wp.launch(
             K.p2g_cell,
             dim=n,
-            inputs=[self.px, self.pmass, self.prad, self.cell_mass, self.cell_wsum, self.cfg.dx],
+            inputs=[self.px, self.pmass, self.prad, self.pstate,
+                    self.cell_mass, self.cell_wsum, self.cfg.dx],
             device=self.dev,
         )
         for ax in range(3):
@@ -281,7 +299,7 @@ class Simulator:
         wp.launch(
             K.g2p,
             dim=self.n_particles,
-            inputs=[self.px, self.pv, self.ptype, *self.vel, *self.dvel,
+            inputs=[self.px, self.pv, self.ptype, self.pstate, *self.vel, *self.dvel,
                     self.cfg.dx, self.cfg.alpha_flip_liquid, self.cfg.alpha_flip_air],
             device=self.dev,
         )
@@ -300,6 +318,71 @@ class Simulator:
                 self.vel_liq[ax], self._tmp_face[ax] = self._tmp_face[ax], self.vel_liq[ax]
                 self._known[ax], self._known2[ax] = self._known2[ax], self._known[ax]
 
+    def _droplets(self, dt: float):
+        """Escaped particles -> droplets, droplet dynamics (paper 3.4, 7)."""
+        cfg = self.cfg
+        if not cfg.droplets:
+            return
+        mu, sigma = D.lognormal_params(cfg.droplet_radius_mean * cfg.dx,
+                                       cfg.droplet_radius_spread)
+        r_min = 0.02 * cfg.dx
+        r_max = 2.0 * cfg.dx
+        self._counters.zero_()
+
+        wp.launch(
+            D.classify_escaped,
+            dim=self.n_particles,
+            inputs=[self.px, self.ptype, self.pstate, self.pdrop_r, self.phi_cell,
+                    cfg.dx, cfg.delta_phi, mu, sigma, r_min, r_max,
+                    cfg.seed + self.step_index, self._counters],
+            device=self.dev,
+        )
+
+        if cfg.spray_shear_threshold > 0.0:
+            wp.launch(D.velocity_gradient_magnitude, dim=self.res,
+                      inputs=[*self.vel, self.shear, cfg.dx], device=self.dev)
+            wp.launch(
+                D.emit_spray_in_shear,
+                dim=self.n_particles,
+                inputs=[self.px, self.ptype, self.pstate, self.pdrop_r, self.phi_cell,
+                        self.shear, cfg.dx, cfg.spray_shear_threshold,
+                        cfg.spray_emission_rate, mu, sigma, r_min, r_max,
+                        cfg.seed + self.step_index, self._counters],
+                device=self.dev,
+            )
+
+        eps = 1e-4 * cfg.dx
+        lo = wp.vec3(eps, eps, eps)
+        hi = wp.vec3(*[sz - eps for sz in cfg.domain_size])
+        wp.launch(
+            D.advance_droplets,
+            dim=self.n_particles,
+            inputs=[self.px, self.pv, self.pstate, self.pdrop_r, *self.vel,
+                    dt, cfg.dx, wp.vec3(*cfg.gravity), cfg.rho_g, cfg.rho_l,
+                    cfg.droplet_drag_cd, cfg.evaporation_k * cfg.dx * cfg.dx,
+                    r_min, lo, hi, cfg.droplet_max_substeps],
+            device=self.dev,
+        )
+        c = self._counters.numpy()
+        for k, i in (("emitted", 0), ("bubbles", 1), ("merged", 2), ("spray", 3)):
+            self.droplet_stats[k] += int(c[i])
+
+    def rasterize_spray(self):
+        """Rasterise droplets into the high-resolution spray density field.
+
+        Paper 7 only does this at render time, every 5-10 steps.
+        """
+        self.spray_density.zero_()
+        wp.launch(D.rasterize_spray, dim=self.n_particles,
+                  inputs=[self.px, self.pstate, self.pdrop_r,
+                          self.spray_density, self.dx_spray], device=self.dev)
+        return self.spray_density
+
+    def state_counts(self):
+        st = self.pstate.numpy()
+        return {"flip": int((st == 0).sum()), "droplet": int((st == 1).sum()),
+                "dead": int((st == 2).sum())}
+
     def _advect(self, dt: float):
         cfg = self.cfg
         eps = 1e-4 * cfg.dx
@@ -308,8 +391,8 @@ class Simulator:
         wp.launch(
             K.advect_rk3,
             dim=self.n_particles,
-            inputs=[self.px, self.ptype, *self.vel, *self.vel_liq, dt, cfg.dx, lo, hi],
+            inputs=[self.px, self.ptype, self.pstate, *self.vel, *self.vel_liq, dt, cfg.dx, lo, hi],
             device=self.dev,
         )
         wp.launch(K.reflect_at_walls, dim=self.n_particles,
-                  inputs=[self.px, self.pv, lo, hi], device=self.dev)
+                  inputs=[self.px, self.pv, self.pstate, lo, hi], device=self.dev)
