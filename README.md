@@ -13,11 +13,23 @@ parameter defaults, extracted as the implementation reference.
 
 | Stage | Paper sections | State |
 |---|---|---|
-| **1. PF-FLIP core** on a uniform MAC grid | 3.1–3.7 | **done** |
+| **1. PF-FLIP core** on a uniform MAC grid | 3.1–3.7 | **done**, runs end to end |
 | 1b. Uniform-grid Galerkin aggregation MG-PCG | 6.1, 6.3 (uniform case) | **done** |
-| 2. MSBG sparse block grid + adaptive particles | 4, 5 | not started |
-| 3. Adaptive relaxation / active-block queue | 6.2, 6.4 | not started |
+| **2a. MSBG data structure** | 4.1–4.3 | **done**, validated |
+| **2b. Multiresolution Poisson operator** | 4.2, 6.1 | **done**, validated |
+| **2c. Adaptive particles + dual adaptivity** | 5.1–5.4 | **done**, validated |
+| 2d. Multiresolution P2G/G2P | 5.4 step 4 | **not done** — blocks running on MSBG |
+| 3. Multiresolution multigrid, adaptive relaxation | 6.2, 6.4 | not started |
 | 4. Escaped-particle droplets, spray, rendering | 3.4, 7 | not started |
+
+**The adaptive path cannot run a simulation yet.** Stages 2a–2c are built and
+tested in isolation; the missing piece is multiresolution P2G/G2P (2d), without
+which particles and the MSBG grid cannot exchange mass and momentum. The solver
+shipped for the MSBG path (`pfflip/mr_solver.py`) is Jacobi-CG for *validation
+only* — the paper's section 6 multigrid is stage 3.
+
+See `docs/FINDINGS.md` for measured accuracy of the 2:1 coarse-fine flux,
+including the regime where it does **not** converge.
 
 The paper's own implementation is CPU-based (TBB, AVX, no GPU). This port runs
 the algorithm on the GPU via [NVIDIA Warp](https://github.com/NVIDIA/warp), so
