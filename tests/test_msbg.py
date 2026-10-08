@@ -189,3 +189,93 @@ def test_manufactured_solution_converges(n0, nb):
     err = np.abs(sol - ref).max() / np.abs(ref).max()
     assert err < 0.25, f"manufactured solution error {err:.3f} (n0={n0}, nb={nb})"
     return err
+
+
+# ------------------------------------------------- consistency at transitions
+@pytest.mark.parametrize(
+    "field,laplacian,expected_per_volume",
+    [
+        ("linear", 0.0, 0.0),  # must be EXACT
+        ("quadratic", 2.0, 0.5),
+        ("cubic", None, 0.8),
+    ],
+)
+def test_truncation_error_at_coarse_fine_is_O1_not_growing(field, laplacian, expected_per_volume):
+    """Pin down the accuracy of the 2:1 flux.
+
+    The scheme is *consistent*: first-order terms cancel exactly, so a linear
+    field is reproduced to roundoff.  Beyond that the per-volume truncation
+    error at a coarse-fine face is O(1) and **independent of h** -- for
+    ``p = x^2`` it is exactly ``0.25 p'' = 0.5``.  That follows from the
+    one-sided difference ``(p_F - p_C)/(1.5h)`` approximating the gradient at
+    the cell-pair midpoint rather than at the face, an offset of ``h/4``.
+
+    This is the known behaviour of the Losasso et al. 2004 flux the paper cites
+    (4.2), not an implementation defect, and it is why the solution error still
+    converges when transitions occupy a vanishing fraction of the domain
+    (refinement *bands* around the interface, paper fig. 9a) but stalls on a
+    pathological checkerboard map.  See scripts/mms_study.py.
+    """
+    prev = None
+    for nb in (2, 4):
+        g = MSBG((nb,) * 3, n0=8, h0=1.0 / (nb * 8), device=DEV, max_level=1)
+        g.build(checker_levels(g, "slab"))
+        n = g.ncells
+        bf = wp.array(np.ones(n * 3, np.float32), dtype=float, device=DEV)
+        ctr = wp.zeros(n, dtype=wp.vec3, device=DEV)
+        vol = wp.zeros(n, dtype=float, device=DEV)
+        interior = wp.zeros(n, dtype=wp.int32, device=DEV)
+
+        @wp.kernel
+        def _ctr(gr: mro.Grid, c: wp.array(dtype=wp.vec3), f: wp.array(dtype=wp.int32)):
+            a = wp.tid()
+            c[a] = cell_center(gr, a)
+            o = mro.cell_origin_finest(gr, a)
+            ext = 1 << o[3]
+            ok = int(1)
+            for ax in range(3):
+                e = mro._step(ax)
+                for s in range(2):
+                    if s == 0:
+                        fx, fy, fz = o[0] - e[0], o[1] - e[1], o[2] - e[2]
+                    else:
+                        fx, fy, fz = o[0] + e[0] * ext, o[1] + e[1] * ext, o[2] + e[2] * ext
+                    if mro.locate(gr, fx, fy, fz).addr < 0:
+                        ok = 0
+            f[a] = ok
+
+        wp.launch(_ctr, dim=n, inputs=[g.g, ctr, interior], device=DEV)
+        wp.launch(mro.cell_volume, dim=n, inputs=[g.g, vol], device=DEV)
+        x = ctr.numpy().astype(np.float64)
+        V = vol.numpy().astype(np.float64)
+        I = interior.numpy().astype(bool)
+
+        if field == "linear":
+            p, exact = x[:, 0], np.zeros_like(V)
+        elif field == "quadratic":
+            p, exact = x[:, 0] ** 2, -laplacian * V
+        else:
+            p, exact = x[:, 0] ** 3, -6 * x[:, 0] * V
+
+        out = wp.zeros(n, dtype=float, device=DEV)
+        wp.launch(
+            mro.apply_A,
+            dim=n,
+            inputs=[g.g, wp.array(p.astype(np.float32), dtype=float, device=DEV), bf, out],
+            device=DEV,
+        )
+        per_vol = (np.abs(out.numpy().astype(np.float64) - exact) / V)[I].max()
+
+        if field == "linear":
+            assert per_vol < 1e-4, f"linear field not reproduced exactly ({per_vol:.2e})"
+        else:
+            assert per_vol == pytest.approx(expected_per_volume, abs=0.1), (
+                f"{field}: per-volume truncation error {per_vol:.4f}, expected "
+                f"~{expected_per_volume} independent of h"
+            )
+            if prev is not None:
+                assert abs(per_vol - prev) < 0.1, (
+                    f"{field}: truncation error moved {prev:.3f} -> {per_vol:.3f} when h halved; "
+                    "it must be h-independent"
+                )
+            prev = per_vol

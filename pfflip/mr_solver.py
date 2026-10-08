@@ -127,6 +127,10 @@ class MRSolver:
             wp.launch(_jacobi, dim=n, inputs=[self.r, self.diag, self.zv], device=dev)
             self._remove_mean(self.zv)
             rz_new = self._reduce(_dot, self.r, self.zv)
+            if rz == 0.0 or rz_new <= 0.0:
+                # float32 stagnation: the residual can no longer be reduced, so
+                # beta is meaningless.  Stop rather than divide by zero.
+                break
             wp.launch(_scale_add, dim=n, inputs=[self.q, rz_new / rz, self.zv], device=dev)
             rz = rz_new
 
