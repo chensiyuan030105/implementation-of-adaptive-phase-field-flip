@@ -138,10 +138,14 @@ class _MGLevel:
 class MRMultigrid:
     """V-cycle preconditioner over the MSBG multigrid hierarchy."""
 
-    def __init__(self, grid: MSBG, device, *, omega=6.0 / 7.0, pre=2, post=2,
-                 coarsest_sweeps=80, min_cells=512):
+    def __init__(self, grid: MSBG, device, *, omega=6.0 / 7.0, pre=3, post=3,
+                 coarsest_sweeps=80, min_cells=512, smoother="rbgs",
+                 n_iter_max=12, theta_sigma=2.0):
         self.dev = device
         self.omega = omega
+        self.smoother_kind = smoother
+        self.n_iter_max = n_iter_max
+        self.theta_sigma = theta_sigma
         self.pre = pre
         self.post = post
         self.coarsest_sweeps = coarsest_sweeps
@@ -163,6 +167,16 @@ class MRMultigrid:
             L += 1
         self.nlev = len(self.levels)
 
+        self.adaptive = None
+        if smoother == "adaptive":
+            from .adaptive_relax import AdaptiveSmoother
+
+            self.adaptive = [
+                AdaptiveSmoother(lv.grid, device, omega=omega,
+                                 n_iter_max=n_iter_max, theta_sigma=theta_sigma)
+                for lv in self.levels
+            ]
+
     # ----------------------------------------------------------------- utils
     def _remove_mean(self, a, n):
         self._scalar.zero_()
@@ -183,7 +197,12 @@ class MRMultigrid:
                       inputs=[lv.grid.g, lv.bface, lv.diag], device=self.dev)
 
     # ----------------------------------------------------------------- cycle
-    def _smooth(self, lv: _MGLevel, n_sweeps, reverse=False):
+    def _smooth(self, lv: _MGLevel, n_sweeps, reverse=False, index=0, record=False,
+                plain=False):
+        if self.adaptive is not None and not plain:
+            # Algorithm 2: smoothing effort follows the residual, not the grid
+            self.adaptive[index].smooth(lv.p, lv.b, lv.bface, lv.diag, index, record=record)
+            return
         colors = (1, 0) if reverse else (0, 1)
         for _ in range(n_sweeps):
             for c in colors:
@@ -194,10 +213,12 @@ class MRMultigrid:
     def _vcycle(self, i=0):
         lv = self.levels[i]
         if i == self.nlev - 1:
-            self._smooth(lv, self.coarsest_sweeps)
+            # the coarsest level is a near-solve, not a smoothing pass: it needs
+            # its full sweep count, so adaptive deactivation must not apply
+            self._smooth(lv, self.coarsest_sweeps, index=i, plain=True)
             self._remove_mean(lv.p, lv.n)
             return
-        self._smooth(lv, self.pre)
+        self._smooth(lv, self.pre, index=i, record=self._record)
         wp.launch(mro.residual, dim=lv.n,
                   inputs=[lv.grid.g, lv.p, lv.b, lv.bface, lv.r], device=self.dev)
         c = self.levels[i + 1]
@@ -209,7 +230,9 @@ class MRMultigrid:
         wp.launch(prolong_add, dim=lv.n,
                   inputs=[lv.grid.g, c.grid.g, c.p, lv.p], device=self.dev)
         # reversed colour order keeps the cycle close to symmetric
-        self._smooth(lv, self.post, reverse=True)
+        self._smooth(lv, self.post, reverse=True, index=i)
+
+    _record = False
 
     def precondition(self, r_in, z_out):
         L0 = self.levels[0]

@@ -20,7 +20,7 @@ parameter defaults, extracted as the implementation reference.
 | **2c. Adaptive particles + dual adaptivity** | 5.1–5.4 | **done**, validated |
 | **2d. Multiresolution P2G/G2P** | 5.4 step 4 | **done**, validated |
 | **3. Multiresolution multigrid** | 6.1–6.3 | **done**, validated |
-| 3b. Adaptive relaxation (active-block queue, θ) | 6.4 | not started |
+| **3b. Adaptive relaxation** | 6.4 | **done**, but measured a net loss on GPU — see `docs/FINDINGS.md` |
 | **4. Escaped-particle droplets + spray** | 3.4, 7 | **done** (renderer is single-scatter, not the paper's MSBG tracer) |
 
 The adaptive path runs end to end. The section 6 multigrid keeps the iteration

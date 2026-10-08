@@ -253,3 +253,57 @@ def test_noise_margin_guard_fires():
     assert warns(8, 1.0), "ppc=8 at alpha_phi=1 is the configuration that diverges"
     assert not warns(27, 1.0), "ppc=27 at alpha_phi=1 was measured safe"
     assert not warns(8, 0.25), "alpha_phi=0.25 at ppc=8 was measured safe"
+
+
+def test_adaptive_smoother_is_correct_if_not_faster():
+    """The 6.4 smoother must reach the same solution as the plain one.
+
+    It is *not* faster here -- plain multigrid with one extra sweep beats it in
+    both iteration count and wall-clock (docs/FINDINGS.md) -- but it must still
+    be a valid preconditioner.
+    """
+    import warp as wp
+
+    from pfflip import mr_operator as mro
+    from pfflip.mr_solver import MRSolver
+    from pfflip.msbg import MSBG, Grid, cell_center
+
+    @wp.kernel
+    def _ctr(g: Grid, c: wp.array(dtype=wp.vec3)):
+        a = wp.tid()
+        c[a] = cell_center(g, a)
+
+    nb, n0 = 4, 16
+    g = MSBG((nb,) * 3, n0=n0, h0=1.0 / (nb * n0), device=DEV, max_level=1)
+    bx, _, _ = np.meshgrid(*[np.arange(nb)] * 3, indexing="ij")
+    g.build(np.where(bx < nb // 2, 0, 1).ravel().astype(np.int32))
+    n = g.ncells
+
+    c = wp.zeros(n, dtype=wp.vec3, device=DEV)
+    v = wp.zeros(n, dtype=float, device=DEV)
+    wp.launch(_ctr, dim=n, inputs=[g.g, c], device=DEV)
+    wp.launch(mro.cell_volume, dim=n, inputs=[g.g, v], device=DEV)
+    x, V = c.numpy().astype(np.float64), v.numpy().astype(np.float64)
+
+    bf = np.ones(n * 3, np.float32)
+    bf[np.repeat(x[:, 1] < 0.5, 3)] = 1e-3
+    k = 2 * np.pi
+    ex = np.cos(k * x[:, 0]) * np.cos(k * x[:, 1]) * np.cos(k * x[:, 2])
+    b = 3 * k * k * ex * V
+    b -= b.mean()
+    bfw = wp.array(bf, dtype=float, device=DEV)
+    rhsw = wp.array(b.astype(np.float32), dtype=float, device=DEV)
+
+    sols = {}
+    for kind in ("mg", "mg-adaptive"):
+        p = wp.zeros(n, dtype=float, device=DEV)
+        kw = {"n_iter_max": 6} if kind == "mg-adaptive" else {}
+        it, rel = MRSolver(g, DEV, preconditioner=kind, **kw).solve(
+            bfw, rhsw, p, tol=1e-4, max_iter=300
+        )
+        assert rel < 1e-4, f"{kind} did not converge ({rel:.2e} after {it})"
+        s = p.numpy().astype(np.float64)
+        sols[kind] = s - s.mean()
+
+    diff = np.abs(sols["mg"] - sols["mg-adaptive"]).max() / np.abs(sols["mg"]).max()
+    assert diff < 2e-3, f"the two preconditioners disagree by {diff:.2e}"

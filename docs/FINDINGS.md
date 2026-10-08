@@ -290,3 +290,81 @@ at 64³ / 7M particles the spray reads as discrete beads rather than mist —
 there are only ~10⁴ droplets where the paper has billions of particles. That
 gap is the paper's motivation for adaptivity and scale, not something a
 renderer can close.
+
+---
+
+# Adaptive relaxation (6.4) does not pay off on the GPU
+
+Implemented faithfully, measured, and found to be a **net loss** here. Kept
+available as `preconditioner="mg-adaptive"` but not the default.
+
+## The control that settles it
+
+The adaptive smoother does `warmup_sweeps = 2` guaranteed full sweeps plus up
+to `n_iter_max` adaptive iterations, the first of which is also full — so three
+full sweeps in practice, against `pre = 2` for the plain smoother. Comparing
+against plain multigrid *with three sweeps* removes that confound:
+
+| grid | mg pre=2 | mg pre=3 | mg-adaptive |
+|---|---|---|---|
+| 64³ | 9 it / 0.31 s | **6 it / 0.22 s** | 7 it / 0.40 s |
+| 128³ | 11 it / 0.39 s | **8 it / 0.29 s** | 8 it / 0.73 s |
+| 256³ | 15 it / 3.13 s | **9 it / 2.06 s** | 9 it / 2.50 s |
+
+Plain multigrid with one extra sweep matches or beats the adaptive version on
+iteration count and is faster in wall-clock at every size. **The entire apparent
+gain was the third sweep; the adaptive mechanism contributed nothing and cost
+20–80% overhead.**
+
+## Why
+
+1. **The paper's win is explicitly CPU-cache-bound.** Section 6.4: "After a few
+   iterations the remaining active block set often fits entirely into the CPU's
+   last-level cache, eliminating the RAM bandwidth bottleneck typical of
+   relaxation-type small-stencil sweeps during later iterations." On an H100 a
+   full red-black sweep over 9.4M cells is already bandwidth-saturated and
+   cheap; there is no last-level-cache residency effect to exploit.
+
+2. **The machinery costs more than it saves on a GPU.** Per adaptive iteration
+   it adds a per-cell pass to record `|delta|`, a per-block `atomic_max`
+   reduction, a neighbour-activation kernel, and — for `theta` — a device
+   readback, which is a full pipeline sync.
+
+3. **Too few blocks for the statistical threshold.** At `n0 = 16` the block
+   counts here are 64 / 512 / 4096. `theta = mean(log r) + 2 std(log r)` over
+   that few samples frequently lands *above* the sample maximum, so the active
+   set collapses to 0–3% after a single sweep instead of the paper's ~10%. The
+   paper's grids have orders of magnitude more blocks.
+
+## Two bugs the measurement exposed
+
+1. **The `l(i,L) <= L` initial active set does not transfer.** The paper seeds
+   the active list with relaxation-relevant blocks only, which relies on its
+   *shared* storage: a bottomed-out block is carried between multigrid levels
+   by reference (Algorithm 1's copy-by-reference case), so relaxing it at the
+   coarse level updates the memory the fine level reads. Here each multigrid
+   level owns its arrays with explicit restriction/prolongation, so gating that
+   way leaves coarse-block unknowns relaxed only at the coarse level, with the
+   correction arriving by piecewise-constant injection. Cost measured:
+   9 → 37, 11 → 81, 13 → 129 iterations.
+
+2. **The coarsest level must not be adaptively deactivated.** It is a
+   near-solve (80 sweeps), not a smoothing pass. Letting the adaptive smoother
+   starve it to 2 sweeps cost 13 → 23 iterations at 256³.
+
+## What is faithful in the implementation
+
+* the contrast-equalised effective residual — max `|delta|` over a block's
+  cells **times the diagonal**, which is the paper's fix for the air phase's
+  diagonal being 1000× the water's and thereby compressing its dynamic range;
+* the adaptive threshold from the log-histogram, `mean + 2 std`, recomputed per
+  preconditioner application;
+* residual-driven block deactivation with neighbour re-activation;
+* the fixed `N_iter_max` cutoff rather than running to exhaustion.
+
+Deviations: the block-local adaptive sweep count (`repeat until r/r0 < 1/3`) is
+fixed, since that loop is block-serial and a GPU thread cannot usefully sweep a
+16³ block — the paper notes this count "is not critical for overall
+convergence". Neighbour re-activation uses the whole-block maximum rather than
+per-face border maxima, which activates a superset and so cannot hurt
+convergence.

@@ -6,6 +6,8 @@ preconditioners are available:
 
 * ``"mg"`` (default) -- one V-cycle of :class:`pfflip.mr_multigrid.MRMultigrid`,
   the multiresolution multigrid of section 6;
+* ``"mg-adaptive"`` -- the same V-cycle with the adaptive relaxation smoother
+  of 6.4 (Algorithm 2);
 * ``"jacobi"`` -- diagonal scaling, kept for comparison.  At the paper's
   1000:1 density contrast this needs hundreds of iterations, which is exactly
   the ill-conditioning section 6 exists to remove.
@@ -72,9 +74,11 @@ class MRSolver:
         self.dev = device
         self.kind = preconditioner
         self.mg = None
-        if preconditioner == "mg":
+        if preconditioner in ("mg", "mg-adaptive"):
             from .mr_multigrid import MRMultigrid
 
+            if preconditioner == "mg-adaptive":
+                mg_kwargs.setdefault("smoother", "adaptive")
             self.mg = MRMultigrid(grid, device, **mg_kwargs)
         n = grid.ncells
         self.n = n

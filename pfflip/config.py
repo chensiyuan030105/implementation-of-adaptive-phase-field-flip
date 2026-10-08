@@ -61,8 +61,10 @@ class Config:
     """Paper 8.3: 1e-4 for all production examples."""
 
     pcg_max_iter: int = 200
-    mg_pre_sweeps: int = 2
-    mg_post_sweeps: int = 2
+    mg_pre_sweeps: int = 3
+    mg_post_sweeps: int = 3
+    """3 measured faster than 2 end-to-end: the extra sweep cuts CG iterations
+    by ~1/3 for less than its own cost.  See docs/FINDINGS.md."""
     mg_coarsest_sweeps: int = 60
     mg_omega: float = 6.0 / 7.0
     """Damping weight of the hybrid Gauss-Seidel smoother; 6/7 is the 3D
