@@ -41,3 +41,60 @@ fails for a pathological map where transitions are everywhere.
 enough) so that transition cells stay a small fraction of the total.  A
 checkerboard-like refinement map is not merely inefficient — it does not
 converge.
+
+---
+
+# Stage 2d: multiresolution P2G/G2P
+
+## The split-jitter bug
+
+`Particles.resample` passed a hardcoded `r0 = 1.0` to `emit_particles`, so
+split children were jittered by `±0.5 * 1.0 * 2**l_p` **in world units** —
+across the entire unit-cube domain instead of inside the parent cell.
+
+Symptom: on a hydrostatic pool the liquid centroid jumped from 0.250 to 0.377
+in a *single* step, which is impossible by advection (it would need |v| ≈ 12
+while the measured maximum was 0.44). The existing unit test asserted
+`|child − parent| < 1.0 * 2**2`, a threshold of 4.0 in a domain of size 1 — far
+too loose to see it. The test now expresses the bound in units of `r0`.
+
+After the fix the centroid holds to 0.25000 → 0.25011 over 20 steps.
+
+## Phase-field normalisation is density-coupled
+
+A level-`l` particle carries `2**(3l)` the mass of a level-0 one, so the raw
+P2G accumulator is divided by `2**(3l)` to let eq. (7) keep its level-0
+constants everywhere. That is only valid when the particle **density** also
+matches the level, i.e. `8**-l` of the level-0 count — exactly what
+probabilistic coarsening produces.
+
+If particles are promoted without being thinned, the raw density is inflated by
+`8**l` and the air phase stops clamping to zero: at level 2 it reads
+`φ ≈ sqrt(64/1000) ≈ 0.25`. Since cells are tagged air/liquid at `φ = 0.5`,
+a large enough mismatch would silently mis-tag the air as liquid and corrupt
+the density field feeding the pressure solve. The dual-adaptivity loop keeps
+the two in sync; this is the invariant it has to maintain.
+
+## Rate-limiting level changes
+
+The paper's `prob_del = 1 − 8**-(l_new − l_p)` handles multi-level jumps
+analytically, but a 2-level jump deletes 63/64 of the particles in one step.
+The grid then follows `M = min(l_p)` down to match, P2G is left catastrophically
+under-sampled, and the phase field — hence the whole pressure solve — is garbage
+for that step. `l_new` is therefore clamped to `l_p ± 1` per step, mirroring in
+time what 2:1 grading does in space.
+
+## What still does not work
+
+On a hydrostatic pool the adaptive path now conserves the liquid centroid, but
+**the velocity field does not settle**: peak liquid speed rises from 0.04 to
+≈1.8 after the first refine/coarsen cycle and stays there, where the same
+scene on a forced-uniform MSBG (`max_level = 0`) settles to ≈0.07, matching
+stage 1. The resample perturbs the P2G density field, which creates spurious
+pressure, and at `α_FLIP ≈ 0.985` with no physical viscosity nothing damps it.
+
+The grid also oscillates between level 0 and level 1 rather than settling into
+stable bands, because the block-resolution `d~` shifts when the resolution
+changes. Both effects are measured at 8 blocks/axis with `n0 = 8` (a 64³ finest
+grid) — far smaller than the regime the method targets, where bands have room
+to be many blocks wide. Whether they persist at scale is untested.

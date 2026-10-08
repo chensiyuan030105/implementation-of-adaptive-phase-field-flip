@@ -139,6 +139,13 @@ def classify_particles(
                 d += wa * wb * wc * dist_blocks[ii, jj, kk]
 
     lnew = wp.clamp(int(wp.floor(wp.abs(beta_bw * d))), 0, max_level)
+    # Move at most one level per step.  The paper's prob_del formula handles
+    # multi-level jumps analytically, but a 2-level jump deletes 63/64 of the
+    # particles in a single step: the grid then follows M = min(l_p) down, P2G
+    # is left catastrophically under-sampled, and the phase field -- hence the
+    # whole pressure solve -- is garbage for that step.  Rate-limiting keeps
+    # the resample a smooth process, mirroring the 2:1 grading in space.
+    lnew = wp.clamp(lnew, lp - 1, lp + 1)
     lnew_out[p] = lnew
 
     if lnew < lp:
@@ -322,8 +329,13 @@ class Particles:
 
     # ------------------------------------------------------------------ resample
     def resample(self, dist_blocks, block_extent, *, beta_bw, max_level,
-                 defer_threshold=3, seed=0):
+                 r0, defer_threshold=3, seed=0):
         """One dual-adaptivity pass: classify, then compact with splits.
+
+        ``r0`` is the base particle radius (= finest grid spacing); split
+        children are jittered within the parent's cell, whose extent is
+        ``r0 * 2**l_p``, so passing the wrong ``r0`` scatters children across
+        the domain instead of inside one cell.
 
         Returns ``(n_before, n_after)``.
         """
@@ -349,7 +361,7 @@ class Particles:
             inputs=[self.x, self.v, self.type, self.level, self.defer, self._lnew,
                     self._nout, self._off, defer_threshold,
                     self._ox, self._ov, self._otype, self._olev, self._odefer,
-                    1.0, seed + 7919],
+                    r0, seed + 7919],
             device=self.dev,
         )
         self.x, self._ox = self._ox, self.x

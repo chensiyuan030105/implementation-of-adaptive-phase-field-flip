@@ -57,7 +57,7 @@ def test_probabilistic_coarsening_thins_by_eight():
 
     kept = None
     for step in range(5):  # hysteresis must delay the first three attempts
-        before, after = ps.resample(dist, 0.25, beta_bw=1.0, max_level=3, seed=step)
+        before, after = ps.resample(dist, 0.25, beta_bw=1.0, max_level=3, r0=0.01, seed=step)
         if step < 2:
             assert after == before, f"coarsening fired early at step {step} (D_p < 3)"
         else:
@@ -76,9 +76,9 @@ def test_coarsening_hysteresis_resets():
     near = wp.array(np.zeros((4, 4, 4), np.float32), dtype=float, device=DEV)
 
     for _ in range(2):
-        ps.resample(far, 0.25, beta_bw=1.0, max_level=3)  # D_p -> 2
+        ps.resample(far, 0.25, beta_bw=1.0, max_level=3, r0=0.01)  # D_p -> 2
     assert ps.defer.numpy()[: ps.n].max() == 2
-    ps.resample(near, 0.25, beta_bw=1.0, max_level=3)  # criterion says stay fine
+    ps.resample(near, 0.25, beta_bw=1.0, max_level=3, r0=0.01)  # criterion says stay fine
     assert ps.defer.numpy()[: ps.n].max() == 0, "hysteresis counter did not reset"
 
 
@@ -88,12 +88,16 @@ def test_splitting_produces_eight_children_in_place():
     pos = np.array([[0.5, 0.5, 0.5]], np.float32)
     ps = make_set(pos, level=2)
     near = wp.array(np.zeros((4, 4, 4), np.float32), dtype=float, device=DEV)
-    before, after = ps.resample(near, 0.25, beta_bw=1.0, max_level=3)
+    r0 = 0.01  # finest grid spacing
+    before, after = ps.resample(near, 0.25, beta_bw=1.0, max_level=3, r0=r0)
     assert (before, after) == (1, 8)
     assert (ps.level.numpy()[:8] == 1).all(), "children must be one level finer"
     child = ps.x.numpy()[:8]
-    # all children stay within the parent's cell (half-extent r0 * 2**l_p)
-    assert np.abs(child - pos).max() < 1.0 * 2**2, "children escaped the parent cell"
+    # Children must land inside the parent's *cell*, whose half-extent is
+    # r0 * 2**l_p / 2.  An earlier version passed r0 = 1.0 here and scattered
+    # children across the whole domain; the bound must be tight enough to see
+    # that, so it is expressed in units of r0 rather than as a loose constant.
+    assert np.abs(child - pos).max() < r0 * 2**2, "children escaped the parent cell"
     # and they must be spread across the 8 octants, not stacked
     octants = {tuple(np.sign(c - pos[0]).astype(int)) for c in child}
     assert len(octants) == 8, f"children occupy only {len(octants)} octants"
@@ -121,7 +125,7 @@ def test_coarsening_conserves_mass_in_expectation():
 
     dist = wp.array(np.full((4, 4, 4), 1.5, np.float32), dtype=float, device=DEV)
     for step in range(3):
-        ps.resample(dist, 0.25, beta_bw=1.0, max_level=3, seed=step)
+        ps.resample(dist, 0.25, beta_bw=1.0, max_level=3, r0=0.01, seed=step)
     ps.update_mass_radius(1.0, 1000.0, 1.0)
     m_after = ps.mass.numpy()[: ps.n].sum()
     rel = abs(m_after - m_before) / m_before
