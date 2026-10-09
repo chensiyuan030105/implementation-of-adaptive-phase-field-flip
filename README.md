@@ -6,8 +6,12 @@ A from-scratch reproduction of
 > **Adaptive Phase-Field-FLIP for Very Large Scale Two-Phase Fluid Simulation.**
 > ACM Trans. Graph. 44(4), SIGGRAPH 2025. [doi:10.1145/3730854](https://doi.org/10.1145/3730854)
 
-`docs/ALGORITHM.md` is a transcription of the paper's algorithms, equations and
-parameter defaults, extracted as the implementation reference.
+**[`docs/REPORT.md`](docs/REPORT.md) is the full reproduction report** —
+what was reproduced, every validation result, the deviations, the bugs found,
+and the negative results.
+
+`docs/ALGORITHM.md` transcribes the paper's algorithms, equations and parameter
+defaults. `docs/FINDINGS.md` holds the raw measurements.
 
 ## Status
 
