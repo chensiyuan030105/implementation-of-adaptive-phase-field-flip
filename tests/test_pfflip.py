@@ -187,3 +187,82 @@ def test_droplets_do_not_contribute_to_the_grid():
     # ratio), so removing a tenth of the liquid removes a tenth of the mass
     removed = 1.0 - m_flip / m_all
     assert abs(removed - 0.10) < 0.02, f"expected ~10% of mass removed, got {100*removed:.1f}%"
+
+
+# ------------------------------------------------------------ solid obstacles
+def test_obstacle_does_not_leak_gravity():
+    """Faces inside an obstacle must stay at zero velocity.
+
+    Gravity is applied to every face, and projection *skips* faces with
+    ``beta = 0`` -- so obstacle faces have to be re-zeroed after the force
+    step or the contamination is permanent.  Without that, the leaked velocity
+    shows up as spurious divergence on the next step and the pressure solve
+    diverges: a surge scene went from a bounded |v| of 4.6 -> 10 to 13 -> 345
+    within ten steps.
+    """
+    cfg = Config(res=(32,) * 3, dx=1 / 32, cfl=1.0, device=DEV, ppc=8, droplets=False)
+    sim = Simulator(cfg)
+    pos, vel, pt, solid = scenes.wave_vs_tower(cfg)
+    sim.set_particles(pos, vel, pt)
+    sim.set_solids(solid)
+    assert solid.sum() > 0
+
+    for _ in range(5):
+        sim.step()
+
+    # every face whose coefficient was zeroed must carry zero velocity
+    for ax in range(3):
+        beta = sim.beta[ax].numpy()
+        v = sim.vel[ax].numpy()
+        blocked = beta == 0.0
+        assert blocked.any(), f"axis {ax}: no blocked faces at all"
+        assert np.abs(v[blocked]).max() == 0.0, (
+            f"axis {ax}: velocity leaked onto {int((np.abs(v[blocked]) > 0).sum())} "
+            f"blocked faces, max {np.abs(v[blocked]).max():.3e}"
+        )
+
+
+def test_obstacle_scene_stays_bounded():
+    """A surge breaking on a tower must not blow up."""
+    cfg = Config(res=(32,) * 3, dx=1 / 32, cfl=1.0, device=DEV, ppc=8, droplets=False)
+    sim = Simulator(cfg)
+    pos, vel, pt, solid = scenes.wave_vs_tower(cfg)
+    sim.set_particles(pos, vel, pt)
+    sim.set_solids(solid)
+    v0 = float(np.abs(sim.pv.numpy()).max())
+
+    speeds = []
+    for _ in range(40):
+        sim.step()
+        st = sim.pstate.numpy()
+        speeds.append(float(np.linalg.norm(sim.pv.numpy()[st == 0], axis=1).max()))
+
+    # a collapsing surge accelerates, but only to a few times its launch speed
+    assert max(speeds) < 12 * v0, f"|v| reached {max(speeds):.1f} from v0 = {v0:.2f}"
+    assert np.isfinite(speeds).all()
+
+
+def test_droplets_do_not_throttle_the_time_step():
+    """CFL must be taken over FLIP particles only (paper 7).
+
+    Droplets have their own adaptive sub-stepping precisely so a few fast
+    ballistic drops cannot shrink the grid time step; including them collapsed
+    dt by more than 10x in the surge scene.
+    """
+    cfg = Config(res=(32,) * 3, dx=1 / 32, cfl=1.0, device=DEV, ppc=8, droplets=True)
+    sim = Simulator(cfg)
+    sim.set_particles(*scenes.asteroid_impact(cfg))
+    sim.step()
+
+    # plant one absurdly fast droplet and one equally fast dead particle
+    v = sim.pv.numpy()
+    st = sim.pstate.numpy()
+    v[0] = (500.0, 0.0, 0.0)
+    st[0] = 1  # droplet
+    v[1] = (500.0, 0.0, 0.0)
+    st[1] = 2  # dead
+    sim.pv.assign(v)
+    sim.pstate.assign(st)
+
+    dt = sim.dt_from_cfl()
+    assert dt > cfg.dx / 50.0, f"a single fast droplet collapsed dt to {dt:.2e}"

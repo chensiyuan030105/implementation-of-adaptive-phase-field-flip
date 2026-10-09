@@ -552,8 +552,14 @@ def advect_rk3(
 @wp.kernel
 def particle_max_speed(pv: wp.array(dtype=wp.vec3), pstate: wp.array(dtype=wp.int32),
                        out: wp.array(dtype=float)):
+    """CFL speed over the *FLIP* particles only.
+
+    Droplets carry their own locally adaptive sub-stepping (paper 7), which is
+    exactly so that a handful of fast ballistic drops cannot throttle the grid
+    time step.  Counting them collapsed dt by more than 10x in the surge scene.
+    """
     p = wp.tid()
-    if pstate[p] == 2:
+    if pstate[p] != 0:
         return
     wp.atomic_max(out, 0, wp.length(pv[p]))
 
@@ -585,5 +591,89 @@ def reflect_at_walls(
             va = wp.min(va, 0.0)
         xo[a] = xa
         vo[a] = va
+    px[p] = xo
+    pv[p] = vo
+
+
+# ---------------------------------------------------------------------------
+# solid obstacles
+# ---------------------------------------------------------------------------
+@wp.kernel
+def zero_solid_obstacle_faces(
+    solid: wp.array3d(dtype=wp.int32),
+    beta: wp.array3d(dtype=float),
+    vel: wp.array3d(dtype=float),
+    axis: int,
+):
+    """No-flux on any face touching a solid cell.
+
+    Zeroing the face coefficient removes that neighbour from the 7-point
+    stencil, which is exactly the homogeneous Neumann condition the pressure
+    solve needs at a solid boundary (paper 4.2 follows Losasso et al. 2004 /
+    Weber et al. 2015 for obstacle handling).
+    """
+    i, j, k = wp.tid()
+    nx, ny, nz = solid.shape[0], solid.shape[1], solid.shape[2]
+    im = i - wp.where(axis == 0, 1, 0)
+    jm = j - wp.where(axis == 1, 1, 0)
+    km = k - wp.where(axis == 2, 1, 0)
+    blocked = int(0)
+    if i < nx and j < ny and k < nz:
+        blocked = wp.max(blocked, solid[i, j, k])
+    if im >= 0 and jm >= 0 and km >= 0:
+        blocked = wp.max(blocked, solid[im, jm, km])
+    if blocked == 1:
+        beta[i, j, k] = 0.0
+        vel[i, j, k] = 0.0
+
+
+@wp.kernel
+def push_out_of_solids(
+    px: wp.array(dtype=wp.vec3),
+    pv: wp.array(dtype=wp.vec3),
+    pstate: wp.array(dtype=wp.int32),
+    solid: wp.array3d(dtype=wp.int32),
+    dx: float,
+):
+    """Eject particles that ended up inside an obstacle, killing the inward
+    velocity component along the shallowest escape direction."""
+    p = wp.tid()
+    if pstate[p] == 2:
+        return
+    x = px[p]
+    nx, ny, nz = solid.shape[0], solid.shape[1], solid.shape[2]
+    i = wp.clamp(int(x[0] / dx), 0, nx - 1)
+    j = wp.clamp(int(x[1] / dx), 0, ny - 1)
+    k = wp.clamp(int(x[2] / dx), 0, nz - 1)
+    if solid[i, j, k] == 0:
+        return
+    # search the 6 axial directions for the nearest free cell
+    best = float(1.0e9)
+    bax = int(0)
+    bsg = int(1)
+    for d in range(6):
+        ax = d // 2
+        sg = wp.where(d % 2 == 0, -1, 1)
+        for t in range(1, 8):
+            ii = i + wp.where(ax == 0, sg * t, 0)
+            jj = j + wp.where(ax == 1, sg * t, 0)
+            kk = k + wp.where(ax == 2, sg * t, 0)
+            if ii < 0 or jj < 0 or kk < 0 or ii >= nx or jj >= ny or kk >= nz:
+                break
+            if solid[ii, jj, kk] == 0:
+                dist = float(t)
+                if dist < best:
+                    best = dist
+                    bax = ax
+                    bsg = sg
+                break
+    if best > 1.0e8:
+        return
+    off = (best + 0.5) * dx * float(bsg)
+    xo = wp.vec3(x[0], x[1], x[2])
+    vo = wp.vec3(pv[p][0], pv[p][1], pv[p][2])
+    xo[bax] = x[bax] + off
+    if float(bsg) * vo[bax] < 0.0:
+        vo[bax] = 0.0
     px[p] = xo
     pv[p] = vo

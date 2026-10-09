@@ -1,5 +1,10 @@
 # Phase-Field-FLIP
 
+![Surge breaking on a tower](docs/images/hero_wave_tower.png)
+
+*128³ pressure grid, 55.6M FLIP particles, 384³ spray field, ~245k Lagrangian
+droplets. Rendered with the included single-scattering volumetric ray marcher.*
+
 A from-scratch reproduction of
 
 > Bernhard Braun, Jan Bender, Nils Thuerey.

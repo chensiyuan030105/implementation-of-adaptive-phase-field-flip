@@ -368,3 +368,61 @@ fixed, since that loop is block-serial and a GPU thread cannot usefully sweep a
 convergence". Neighbour re-activation uses the whole-block maximum rather than
 per-face border maxima, which activates a superset and so cannot hurt
 convergence.
+
+---
+
+# Production run: surge breaking on a tower
+
+Scene `wave_vs_tower` (paper fig. 1's setup): a surge released at one end of a
+shallow sea, running up and breaking against a cylindrical tower.
+
+* 128³ pressure grid, 27 particles per cell → **55.6M FLIP particles**
+* 384³ spray density field (3× the pressure resolution, 16-bit float)
+* 36,792 solid cells, CFL 2, ~1.2 s/step on one H100
+* peak **~245,000 Lagrangian droplets** in flight
+* 20–30 MG-PCG iterations per step at 1000:1 density contrast
+
+Images: `docs/images/hero_wave_tower.png`, `wave_tower_wide.png`.
+
+## Two bugs this run exposed
+
+**Obstacle faces leaked gravity.** Gravity is applied to every face, and
+projection *skips* faces with `beta = 0`, so obstacle faces had to be re-zeroed
+after the force step. Without that the contamination is permanent: it reappears
+as spurious divergence the next step and the pressure solve diverges. Measured
+on the surge scene: a bounded |v| of 4.6 → 10 became 13 → **345** within ten
+steps. Isolated by running the same scene with and without the obstacle —
+without it, |v| stayed bounded, which ruled out the scene and the solver.
+
+**Droplets throttled the time step.** `dt_from_cfl` took the maximum speed over
+*all* particles, including ballistic droplets travelling far faster than any
+FLIP particle. Paper 7 gives droplets their own locally adaptive sub-stepping
+precisely so they cannot do this. Counting them collapsed `dt` by more than 10×.
+
+**Droplets leaving the domain were clamped, not deleted**, which piled spray up
+against the boundary and rendered as a hard rectangular slab of mist at the
+ceiling — an obvious artefact in the first renders.
+
+## Unresolved: the surge scene destabilises after t ≈ 0.28 s
+
+`dt` falls from 1.8e-3 to ~1.6e-4, i.e. some FLIP particles reach ~100 m/s in a
+flow launched at 1.7 m/s. The two fixes above did not remove it, so it is a
+third, separate problem — most likely in the thin run-up sheet on the tower,
+where liquid becomes too sparse to tag reliably. **Not investigated.** The
+usable sequence is therefore `t ∈ [0, 0.28]`, which does cover the impact and
+the spray plume but not the full collapse.
+
+## What the renders do and do not show
+
+`pfflip/render.py` detects the `φ = 1/2` crossing and shades it as a surface —
+Fresnel mix of sky reflection and an absorbing body, plus a sun specular and a
+foam response at high interface curvature — while spray scatters with a
+Henyey-Greenstein phase function so backlit mist glows along the sun direction.
+That reproduces the *look* of the paper's figures: curling lip, whitewater on
+the wave face, a vertical plume off the tower, specular ripples.
+
+It is **not** the paper's renderer: no MSBG volumetric tracer, no approximate
+multiple scattering, no particle-skinned surface. And at 128³ with 2.4×10⁵
+droplets the spray still reads as granular rather than as the wispy streamers
+of the paper's figures, which come from billions of particles. That difference
+is the paper's motivation for adaptivity and scale, not a rendering shortfall.

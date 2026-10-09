@@ -119,3 +119,51 @@ SCENES = {
     "asteroid": asteroid_impact,
     "rayleigh_taylor": rayleigh_taylor,
 }
+
+
+# ---------------------------------------------------------------------------
+def wave_vs_tower(cfg: Config, *, sea_level=0.22, column=0.26, tower_r=0.075,
+                  tower_at=(0.62, 0.5), surge=None):
+    """A surge collapsing onto a cylindrical tower -- the paper's figure 1 setup.
+
+    A tall liquid column is released at one end of a shallow sea and given an
+    initial velocity, so it runs up and breaks against a vertical cylinder.
+    This frames well from near the water surface and produces the sheet-and-
+    spray structure the paper's hero image shows.
+
+    Returns ``(pos, vel, ptype, solid_mask)``.
+    """
+    sx, sy, sz = cfg.domain_size
+    nx, ny, nz = cfg.res
+    v0 = surge if surge is not None else 0.55 * np.sqrt(9.81 * sy)
+
+    def mask(p):
+        sea = p[:, 1] < sea_level * sy
+        surge_block = (p[:, 0] < column * sx) & (p[:, 1] < 0.72 * sy)
+        return sea | surge_block
+
+    def vel(p, liq):
+        v = np.zeros_like(p)
+        moving = (p[:, 0] < column * sx) & (p[:, 1] < 0.72 * sy) & liq
+        v[moving, 0] = v0
+        return v
+
+    pos, pvel, ptype = seed(cfg, mask, vel)
+
+    # cylindrical tower, full height
+    ci = (np.arange(nx) + 0.5) / nx
+    ck = (np.arange(nz) + 0.5) / nz
+    I, K = np.meshgrid(ci, ck, indexing="ij")
+    disc = (I - tower_at[0]) ** 2 + (K - tower_at[1]) ** 2 < tower_r**2
+    solid = np.broadcast_to(disc[:, None, :], (nx, ny, nz)).copy()
+    solid[:, -2:, :] = False  # leave the top open so spray can escape
+
+    # drop particles seeded inside the tower
+    keep = ~(
+        ((pos[:, 0] / sx - tower_at[0]) ** 2 + (pos[:, 2] / sz - tower_at[1]) ** 2)
+        < tower_r**2
+    )
+    return pos[keep], pvel[keep], ptype[keep], solid
+
+
+SCENES["wave_vs_tower"] = wave_vs_tower

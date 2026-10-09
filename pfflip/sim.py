@@ -65,6 +65,7 @@ class Simulator:
         self.cell_wsum = z(self.res)
         self.phi_cell = z(self.res)
         self.is_liquid = zi(self.res)
+        self.solid = zi(self.res)   # obstacle mask, 1 = solid
         self.pressure = z(self.res)
         self.rhs = z(self.res)
 
@@ -104,9 +105,15 @@ class Simulator:
         self.rho_0l = self.rho_tilde_0 * cfg.rho_l
         self.rho_min = cfg.eta_phi * cfg.rho_g * self.rho_tilde_0
 
+        self.has_solids = False
         self.time = 0.0
         self.step_index = 0
         self.stats: list[dict] = []
+
+    def set_solids(self, mask: np.ndarray):
+        """Install an obstacle mask (``True`` = solid) on the cell grid."""
+        self.solid.assign(np.ascontiguousarray(mask, np.int32))
+        self.has_solids = bool(mask.any())
 
     # ------------------------------------------------------------------ setup
     def _calibrate_rho_tilde_0(self) -> float:
@@ -252,6 +259,13 @@ class Simulator:
                 inputs=[self.beta[ax], self.vel[ax], ax],
                 device=self.dev,
             )
+            if self.has_solids:
+                wp.launch(
+                    K.zero_solid_obstacle_faces,
+                    dim=self.face_shapes[ax],
+                    inputs=[self.solid, self.beta[ax], self.vel[ax], ax],
+                    device=self.dev,
+                )
 
     def _add_forces(self, dt: float):
         for ax in range(3):
@@ -261,6 +275,14 @@ class Simulator:
                           inputs=[self.vel[ax], g, dt], device=self.dev)
             wp.launch(K.zero_solid_faces, dim=self.face_shapes[ax],
                       inputs=[self.beta[ax], self.vel[ax], ax], device=self.dev)
+            if self.has_solids:
+                # gravity was just added to *every* face, including obstacle
+                # faces.  Projection skips those (beta = 0), so without this the
+                # contamination is permanent: it shows up as spurious divergence
+                # next step and the pressure solve blows up.
+                wp.launch(K.zero_solid_obstacle_faces, dim=self.face_shapes[ax],
+                          inputs=[self.solid, self.beta[ax], self.vel[ax], ax],
+                          device=self.dev)
 
     def _pressure_solve(self, dt: float, verbose: bool = False):
         cfg = self.cfg
@@ -396,3 +418,7 @@ class Simulator:
         )
         wp.launch(K.reflect_at_walls, dim=self.n_particles,
                   inputs=[self.px, self.pv, self.pstate, lo, hi], device=self.dev)
+        if self.has_solids:
+            wp.launch(K.push_out_of_solids, dim=self.n_particles,
+                      inputs=[self.px, self.pv, self.pstate, self.solid, cfg.dx],
+                      device=self.dev)

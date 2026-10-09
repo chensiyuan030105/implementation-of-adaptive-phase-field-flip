@@ -266,13 +266,16 @@ def advance_droplets(
                 pstate[p] = STATE_DEAD
                 return
 
+    # A droplet that leaves the domain is gone, not stuck to the wall.
+    # Clamping instead piles spray up against the boundary and renders as a
+    # hard rectangular slab of mist at the ceiling.
+    for a in range(3):
+        if x[a] <= lo[a] or x[a] >= hi[a]:
+            pstate[p] = STATE_DEAD
+            return
     pdrop_r[p] = r
     pv[p] = vel
-    px[p] = wp.vec3(
-        wp.clamp(x[0], lo[0], hi[0]),
-        wp.clamp(x[1], lo[1], hi[1]),
-        wp.clamp(x[2], lo[2], hi[2]),
-    )
+    px[p] = x
 
 
 @wp.func
