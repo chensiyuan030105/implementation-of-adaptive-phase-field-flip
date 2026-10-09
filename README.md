@@ -1,9 +1,12 @@
 # Phase-Field-FLIP
 
-![Surge breaking on a tower](docs/images/hero_wave_tower.png)
+![Surge breaking on a tower](docs/images/wave_tower.gif)
 
-*128³ pressure grid, 55.6M FLIP particles, 384³ spray field, ~245k Lagrangian
-droplets. Rendered with the included single-scattering volumetric ray marcher.*
+*128³ pressure grid, 55.6M FLIP particles, 384³ spray field, ~171k Lagrangian
+droplets in flight. 73 frames on a constant time grid, rendered across 8 H100s
+with the included single-scattering volumetric ray marcher.
+Full resolution: [`wave_tower.mp4`](docs/images/wave_tower.mp4) ·
+[still](docs/images/hero_wave_tower.png)*
 
 A from-scratch reproduction of
 

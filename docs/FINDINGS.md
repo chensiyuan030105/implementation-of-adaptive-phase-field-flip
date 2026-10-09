@@ -426,3 +426,15 @@ multiple scattering, no particle-skinned surface. And at 128³ with 2.4×10⁵
 droplets the spray still reads as granular rather than as the wispy streamers
 of the paper's figures, which come from billions of particles. That difference
 is the paper's motivation for adaptivity and scale, not a rendering shortfall.
+
+## Frame spacing for animation
+
+Dumping every N *steps* produces unusable playback once `dt` varies: the first
+14 frames of the production run spanned `t = 0.009 … 0.279` while the next 14
+were squeezed into `0.289 … 0.339`, so at constant frame rate the motion races
+and then freezes. Frames are therefore emitted on a **constant time grid**,
+with the step loop sub-stepping to land exactly on each frame time
+(`scripts/render_sequence.py`, and the `anim` run script).
+
+73 frames over `t ∈ [0, 0.285]` took 311 solver steps and 444 s; rendering
+them at 1600×900, 2 spp sharded across 8 H100s took about a minute.
