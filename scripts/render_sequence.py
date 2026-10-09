@@ -74,12 +74,12 @@ def main():
     ap.add_argument("--preset", default="golden")
     ap.add_argument("--width", type=int, default=1600)
     ap.add_argument("--height", type=int, default=900)
-    ap.add_argument("--azimuth", type=float, default=20.0)
-    ap.add_argument("--elevation", type=float, default=6.0)
-    ap.add_argument("--distance", type=float, default=0.72)
-    ap.add_argument("--target", type=float, nargs=3, default=(0.55, 0.24, 0.5),
+    ap.add_argument("--azimuth", type=float, default=46.0)
+    ap.add_argument("--elevation", type=float, default=11.0)
+    ap.add_argument("--distance", type=float, default=0.92)
+    ap.add_argument("--target", type=float, nargs=3, default=(0.5, 0.32, 0.5),
                     help="orbit target as a fraction of the domain")
-    ap.add_argument("--fov", type=float, default=44.0)
+    ap.add_argument("--fov", type=float, default=42.0)
     ap.add_argument("--spp", type=int, default=2)
     ap.add_argument("--steps", type=int, default=640)
     ap.add_argument("--exposure", type=float, default=1.0)
