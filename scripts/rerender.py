@@ -37,6 +37,11 @@ class _Frame:
         self._spray16 = wp.array(spray.astype(np.float16), dtype=wp.float16, device=device)
         self.cfg = Config(res=phi.shape, dx=float(d["dx"]), device=device)
 
+        sp = os.path.join(os.path.dirname(path) or ".", "solid.npz")
+        self.solid = None
+        if os.path.exists(sp):
+            self.solid = wp.array(np.load(sp)["solid"], dtype=float, device=device)
+
     def rasterize_spray(self):
         return self._spray16
 
@@ -56,14 +61,15 @@ def main():
     ap.add_argument("--steps", type=int, default=760)
     ap.add_argument("--k-spray", type=float, default=130.0)
     ap.add_argument("--exposure", type=float, default=1.0)
-    ap.add_argument("--target-y", type=float, default=0.26)
+    ap.add_argument("--target", type=float, nargs=3, default=(0.5, 0.26, 0.5),
+                    help="orbit target as a fraction of the domain")
     ap.add_argument("--sun", type=float, nargs=3, default=(-0.62, 0.34, -0.66))
     ap.add_argument("--device", default="cuda:0")
     args = ap.parse_args()
 
     # the renderer's orbit target is a fraction of the domain; expose the
     # vertical part so the camera can be dropped to just above the water
-    render.orbit_camera.__defaults__ = ((0.5, args.target_y, 0.5),)
+    render.orbit_camera.__defaults__ = (tuple(args.target),)
 
     for i, f in enumerate(args.frames):
         fr = _Frame(f, args.device)

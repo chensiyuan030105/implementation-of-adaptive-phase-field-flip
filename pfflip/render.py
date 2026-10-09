@@ -17,6 +17,12 @@ carry the look of a large-scale water shot:
 High-curvature interface regions are tinted toward a foam response, which paper
 7 also does ("foam-like scattering coefficients").
 
+Two things keep the frame from reading as a laboratory tank rather than open
+water: **solid obstacles are shaded** (otherwise the flow visibly wraps around
+nothing), and rays that leave the domain fall back onto an **analytic sea plane**
+at the rest water level, so the simulated patch joins a horizon instead of
+ending at a visible wall.
+
 Rendered every 5-10 steps, as the paper does: spray rasterisation and surface
 shading are render-time operations.
 """
@@ -111,6 +117,9 @@ def _transmittance(
 def raymarch(
     phi: wp.array3d(dtype=float),
     spray: wp.array3d(dtype=float),
+    solid: wp.array3d(dtype=float),
+    has_solid: int,
+    sea_y: float,
     img: wp.array3d(dtype=float),
     cam_pos: wp.vec3,
     cam_fwd: wp.vec3,
@@ -163,7 +172,22 @@ def raymarch(
                 t0 = wp.max(t0, wp.min(ta, tb))
                 t1 = wp.min(t1, wp.max(ta, tb))
 
-        bg = _sky(rd, sun_dir, horizon, zenith, sun_col)
+        sky_c = _sky(rd, sun_dir, horizon, zenith, sun_col)
+        bg = sky_c
+        if rd[1] < -1e-4:
+            # the simulated patch is a window onto a larger sea: everything the
+            # ray misses falls back on a flat ocean at the rest water level, so
+            # the domain ends in a horizon rather than a wall
+            tp = (sea_y - cam_pos[1]) / rd[1]
+            if tp > 0.0:
+                nf = wp.vec3(0.0, 1.0, 0.0)
+                ctf = wp.clamp(-rd[1], 0.0, 1.0)
+                ff = 0.02 + 0.98 * wp.pow(1.0 - ctf, 5.0)
+                rf = wp.vec3(rd[0], -rd[1], rd[2])
+                sr = _sky(rf, sun_dir, horizon, zenith, sun_col)
+                sp2 = wp.pow(wp.max(wp.dot(rf, sun_dir), 0.0), 900.0)
+                deep = wp.cw_mul(water_col, wp.vec3(0.55, 0.75, 0.85))
+                bg = deep * (1.0 - ff) + sr * ff + sun_col * sp2 * 1.4
         col = bg
         if t1 > t0:
             dt = (t1 - t0) / float(steps)
@@ -180,10 +204,51 @@ def raymarch(
                     break
                 tcur = t0 + (float(i) + 0.5) * dt
                 x = cam_pos + rd * tcur
+
+                # ---- solid obstacle ------------------------------------------
+                if has_solid == 1:
+                    sv = _phi_at(solid, x, inv_dx)
+                    if sv >= 0.5:
+                        e2 = 1.0 / inv_dx
+                        sx = _phi_at(solid, x + wp.vec3(e2, 0.0, 0.0), inv_dx) - _phi_at(solid, x - wp.vec3(e2, 0.0, 0.0), inv_dx)
+                        sy = _phi_at(solid, x + wp.vec3(0.0, e2, 0.0), inv_dx) - _phi_at(solid, x - wp.vec3(0.0, e2, 0.0), inv_dx)
+                        sz = _phi_at(solid, x + wp.vec3(0.0, 0.0, e2), inv_dx) - _phi_at(solid, x - wp.vec3(0.0, 0.0, e2), inv_dx)
+                        sl = wp.length(wp.vec3(sx, sy, sz))
+                        sn = wp.vec3(0.0, 1.0, 0.0)
+                        if sl > 1e-7:
+                            sn = wp.vec3(-sx / sl, -sy / sl, -sz / sl)
+                        sdl = wp.max(wp.dot(sn, sun_dir), 0.0)
+                        ssh = _transmittance(phi, spray, x + sn * (1.5 / inv_dx), sun_dir,
+                                             inv_dx, inv_dxs, k_shadow_liquid, k_spray,
+                                             sdt, shadow_steps)
+                        rock = wp.vec3(0.16, 0.155, 0.15)
+                        lit_s = rock * (0.30 + 0.70 * sdl * ssh)
+                        lit_s = lit_s + wp.cw_mul(rock, sky_c) * 0.25
+                        acc = acc + lit_s * trans
+                        trans = 0.0
+                        break
+
                 f = _phi_at(phi, x, inv_dx)
 
                 # ---- water surface: the phi = 1/2 crossing -------------------
                 if f >= 0.5 and hit == 0:
+                    # A surface hit on a domain side wall is the *box*, not a
+                    # wave: phi is 1 right up to the boundary, and the box
+                    # stands proud of the sea plane, so shading it draws a
+                    # floating slab.  Below the rest level those faces are
+                    # continuous with the surrounding ocean, so let the ray
+                    # through and pick up the sea plane instead.
+                    edge = 2.0 / inv_dx
+                    on_wall = (
+                        x[0] < edge or x[0] > domain[0] - edge
+                        or x[2] < edge or x[2] > domain[2] - edge
+                    )
+                    if on_wall and x[1] < sea_y + 3.0 / inv_dx:
+                        # continuing the march here would just hit the interior
+                        # noise of the water body; take the ocean colour and stop
+                        acc = acc + bg * trans
+                        trans = 0.0
+                        break
                     hit = 1
                     # refine the crossing by one bisection against the previous
                     # sample so the surface is not quantised to the step size
@@ -300,6 +365,8 @@ def render(
     exposure=1.0,
     seed=0,
     spray=None,
+    solid=None,
+    sea_y=None,
 ):
     """Render the current simulation state to a PNG."""
     import matplotlib
@@ -320,6 +387,16 @@ def render(
 
     wp.launch(_to_f32, dim=spray.shape, inputs=[spray, spray_f], device=dev)
 
+    if solid is None:
+        solid = getattr(sim, "solid", None)
+    if solid is not None and not isinstance(solid, wp.array):
+        solid = wp.array(np.ascontiguousarray(solid, np.float32), dtype=float, device=dev)
+    has_solid = 1 if solid is not None else 0
+    if solid is None:
+        solid = wp.zeros((1, 1, 1), dtype=float, device=dev)
+    if sea_y is None:
+        sea_y = 0.22 * cfg.domain_size[1]
+
     pos, fwd, right, up = orbit_camera(cfg.domain_size, azimuth, elevation, distance)
     sd = np.asarray(sun_dir, float)
     sd /= np.linalg.norm(sd)
@@ -330,7 +407,7 @@ def render(
         raymarch,
         dim=(width, height),
         inputs=[
-            sim.phi_cell, spray_f, img,
+            sim.phi_cell, spray_f, solid, has_solid, float(sea_y), img,
             wp.vec3(*pos), wp.vec3(*fwd), wp.vec3(*right), wp.vec3(*up),
             float(np.tan(np.radians(fov) * 0.5)),
             wp.vec3(*cfg.domain_size),

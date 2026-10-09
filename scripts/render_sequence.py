@@ -28,7 +28,7 @@ def render_shard(files, outdir, rank, device, opts):
     from pfflip import render
     from pfflip.config import Config
 
-    render.orbit_camera.__defaults__ = ((0.5, opts["target_y"], 0.5),)
+    render.orbit_camera.__defaults__ = (tuple(opts["target"]),)
 
     class _Frame:
         def __init__(self, path):
@@ -41,6 +41,11 @@ def render_shard(files, outdir, rank, device, opts):
             self._spray = wp.array(d["spray"].astype(np.float16), dtype=wp.float16,
                                    device=device)
             self.cfg = Config(res=phi.shape, dx=float(d["dx"]), device=device)
+
+            sp = os.path.join(os.path.dirname(path) or ".", "solid.npz")
+            self.solid = None
+            if os.path.exists(sp):
+                self.solid = wp.array(np.load(sp)["solid"], dtype=float, device=device)
 
         def rasterize_spray(self):
             return self._spray
@@ -69,11 +74,12 @@ def main():
     ap.add_argument("--preset", default="golden")
     ap.add_argument("--width", type=int, default=1600)
     ap.add_argument("--height", type=int, default=900)
-    ap.add_argument("--azimuth", type=float, default=46.0)
-    ap.add_argument("--elevation", type=float, default=11.0)
-    ap.add_argument("--distance", type=float, default=0.92)
-    ap.add_argument("--target-y", type=float, default=0.32)
-    ap.add_argument("--fov", type=float, default=42.0)
+    ap.add_argument("--azimuth", type=float, default=20.0)
+    ap.add_argument("--elevation", type=float, default=6.0)
+    ap.add_argument("--distance", type=float, default=0.72)
+    ap.add_argument("--target", type=float, nargs=3, default=(0.55, 0.24, 0.5),
+                    help="orbit target as a fraction of the domain")
+    ap.add_argument("--fov", type=float, default=44.0)
     ap.add_argument("--spp", type=int, default=2)
     ap.add_argument("--steps", type=int, default=640)
     ap.add_argument("--exposure", type=float, default=1.0)
@@ -81,14 +87,16 @@ def main():
     ap.add_argument("--rank", type=int, default=None, help="internal: worker id")
     args = ap.parse_args()
 
-    files = sorted(glob.glob(os.path.join(args.indir, "*.npz")))
+    # solid.npz holds the static obstacle mask, not a frame
+    files = [f for f in sorted(glob.glob(os.path.join(args.indir, "*.npz")))
+             if os.path.basename(f) != "solid.npz"]
     if not files:
         sys.exit(f"no .npz frames in {args.indir}")
     outdir = args.outdir or os.path.join(args.indir, "png")
     opts = dict(
         nworkers=args.gpus, width=args.width, height=args.height,
         azimuth=args.azimuth, elevation=args.elevation, distance=args.distance,
-        target_y=args.target_y, fov=args.fov, spp=args.spp, steps=args.steps,
+        target=tuple(args.target), fov=args.fov, spp=args.spp, steps=args.steps,
         preset=args.preset, exposure=args.exposure, sun=tuple(args.sun),
     )
 
